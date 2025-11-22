@@ -239,6 +239,21 @@ In **2. Training settings**:
   output/<output_folder>/<output_name>.safetensors
   ```
 
+- **Advanced trainer flags & command preview (optional)**  
+  At the bottom of the training settings there is an **“Show advanced trainer flags”** button:
+
+  - When you expand it, you get:
+    - A multiline textbox for **advanced trainer flags**.
+    - A read‑only **“Effective training command (preview)”**.
+  - By default, the textbox is pre‑filled with sensible VRAM‑related flags based on your selected VRAM profile  
+    (e.g. `--fp8_base --fp8_scaled --blocks_to_swap ... --gradient_checkpointing`).
+  - You can edit this textbox directly if you know what you are doing; whatever you write there is appended to the
+    `python qwen_image_train_network.py` command shown in the preview.
+  - This makes it easy for power users to:
+    - tweak or remove VRAM flags
+    - add extra options (dropout, gradient clipping, etc.)
+    - while always seeing exactly what command MusubiTLX will run when you click **Start training**.
+
 #### Step 4 – Check estimated training time
 
 Just below the LoRA filename, the GUI shows a **rough time estimate** based on:

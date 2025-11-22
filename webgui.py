@@ -844,7 +844,7 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
                 proc.wait()
             raise
         except Exception as e:
-            error_msg = f"\n❌ FEL VID CACHE LATENTS: {str(e)}\n"
+            error_msg = f"\n❌ ERROR DURING CACHE LATENTS: {str(e)}\n"
             output_queue.put(error_msg)
             if log_file:
                 log_file.write(error_msg)
@@ -911,7 +911,7 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
                 proc.wait()
             raise
         except Exception as e:
-            error_msg = f"\n❌ FEL VID CACHE TEXT ENCODER: {str(e)}\n"
+            error_msg = f"\n❌ ERROR DURING CACHE TEXT ENCODER: {str(e)}\n"
             output_queue.put(error_msg)
             if log_file:
                 log_file.write(error_msg)
@@ -1320,9 +1320,9 @@ def gui():
                                         output_queue.put("="*60 + "\n")
                                         final_path = os.path.join(output_dir, output_name + ".safetensors")
                                         epoch_path = os.path.join(output_dir, output_name + "-000001.safetensors")
-                                        output_queue.put(f"LoRA-filen har sparats i: {final_path}\n")
+                                        output_queue.put(f"LoRA file has been saved to: {final_path}\n")
                                         if os.path.exists(epoch_path):
-                                            output_queue.put(f"Och epoch-filer som: {epoch_path}\n")
+                                            output_queue.put(f"And epoch files such as: {epoch_path}\n")
                                         output_queue.put(f"Absolute path: {os.path.abspath(final_path)}\n")
                                         output_queue.put(f"Log file: {log_path}\n")
                                         output_queue.put("="*60 + "\n")
@@ -1330,9 +1330,9 @@ def gui():
                                         log_file.write("\n" + "="*60 + "\n")
                                         log_file.write("✅ TRAINING COMPLETED!\n")
                                         log_file.write("="*60 + "\n")
-                                        log_file.write(f"LoRA-filen har sparats i: {final_path}\n")
+                                        log_file.write(f"LoRA file has been saved to: {final_path}\n")
                                         if os.path.exists(epoch_path):
-                                            log_file.write(f"Och epoch-filer som: {epoch_path}\n")
+                                            log_file.write(f"And epoch files such as: {epoch_path}\n")
                                         log_file.write(f"Absolute path: {os.path.abspath(final_path)}\n")
                                         log_file.write("="*60 + "\n")
                                     else:
@@ -1349,16 +1349,16 @@ def gui():
                                 output_queue.put("[TRAINING_FINISHED]\n")  # Signal to close connection
                             except Exception as e:
                                 output_queue.put("\n" + "="*60 + "\n")
-                                output_queue.put(f"❌ FEL: {str(e)}\n")
+                                output_queue.put(f"❌ ERROR: {str(e)}\n")
                                 output_queue.put("="*60 + "\n")
                                 output_queue.put(f"See log file for details: {log_path}\n")
                                 try:
-                                    with open(log_path, "a", encoding="utf-8") as log_file:
-                                        log_file.write("\n" + "="*60 + "\n")
-                                        log_file.write(f"❌ FEL: {str(e)}\n")
-                                        log_file.write("="*60 + "\n")
+                                    with open(log_path, "a", encoding="utf-8") as log_f2:
+                                        log_f2.write("\n" + "="*60 + "\n")
+                                        log_f2.write(f"❌ ERROR: {str(e)}\n")
+                                        log_f2.write("="*60 + "\n")
                                         import traceback
-                                        log_file.write(traceback.format_exc())
+                                        log_f2.write(traceback.format_exc())
                                 except:
                                     pass
                                 output_queue.put("[TRAINING_FINISHED]\n")

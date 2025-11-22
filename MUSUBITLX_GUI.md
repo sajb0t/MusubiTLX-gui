@@ -15,10 +15,12 @@ Musubi Tuner itself is developed in the main project repository: [Musubi Tuner](
   - Drag & drop directly into the preview area.
   - Per‑image caption text fields; captions are saved as `.txt` files next to each image.
 
-- **Auto-caption with ViT-GPT2 (optional)**
-  - Automatically generate captions for all uploaded images using a lightweight ViT-GPT2 image captioning model.
+- **Auto-caption with ViT-GPT2 / BLIP (optional)**
+  - Automatically generate captions for all uploaded images using either:
+    - a lightweight ViT-GPT2 image captioning model (fast, low VRAM), or
+    - a BLIP large image captioning model (slower but more detailed).
   - Requires additional Python dependencies (see the Requirements section below).
-  - Triggered from the GUI via the **“Auto-caption images (ViT-GPT2)”** button in Step 1.
+  - Triggered from the GUI via the **“Auto-caption images (ViT-GPT2 / BLIP)”** button in Step 1.
 
 - **Dataset configuration**
   - Resolution (e.g. `1024x1024`).
@@ -92,7 +94,7 @@ If you plan to use `AdamW8bit`, you also need:
 pip install bitsandbytes
 ```
 
-If you plan to use **auto-captioning**, you also need:
+If you plan to use **auto-captioning (ViT-GPT2 / BLIP)**, you also need:
 
 ```bash
 pip install "transformers>=4.44.0" pillow
@@ -149,15 +151,18 @@ For each image:
 - There is a text field labeled `Caption for image N`.
 - The caption is saved as `<image_name>.txt` in the output folder and used as the text prompt.
 
-##### Optional – Auto-caption images (ViT-GPT2)
+##### Optional – Auto-caption images (ViT-GPT2 / BLIP)
 
 - After selecting or dropping your images, you can click:
 
-  - **Auto-caption images (ViT-GPT2)**
+  - **Auto-caption images (ViT-GPT2 / BLIP)**
 
-- On first use, the captioning model weights will be downloaded from Hugging Face (this can take a while).
+- On first use, the selected captioning model weights will be downloaded from Hugging Face (this can take a while).
 - If the required Python packages are not installed, the GUI will show a clear message with the exact `pip install ...` command to run.
 - Generated captions are written into the same per-image text fields and saved as `.txt` files just like manual captions.
+- You can choose caption model in the dropdown:
+  - **ViT-GPT2 – fast, lightweight** (good for quick tests or low VRAM)
+  - **BLIP large – more detailed** (better descriptions, but slower and uses more VRAM)
 
 #### Step 3 – Configure training
 

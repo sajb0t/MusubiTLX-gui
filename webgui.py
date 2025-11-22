@@ -14,23 +14,40 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 # Global queue for streaming output
 output_queue = queue.Queue()
 
-# Globals for optional auto-captioning (ViT-GPT2)
-caption_model = None
-caption_feature_extractor = None
-caption_tokenizer = None
+# Globals for optional auto-captioning
+caption_vit_model = None
+caption_vit_feature_extractor = None
+caption_vit_tokenizer = None
+caption_blip_model = None
+caption_blip_processor = None
 
-def load_caption_model():
-    """
-    Lazy-load a lightweight image captioning model (ViT-GPT2).
-    If dependencies are missing, raise a RuntimeError with clear instructions
-    instead of crashing the whole app.
-    """
-    global caption_model, caption_feature_extractor, caption_tokenizer
-    if caption_model is not None and caption_feature_extractor is not None and caption_tokenizer is not None:
-        return caption_model, caption_feature_extractor, caption_tokenizer
+# Track active training-related subprocesses so we can cancel them from the UI
+active_processes = []
+active_processes_lock = threading.Lock()
 
+def register_process(proc):
+    with active_processes_lock:
+        active_processes.append(proc)
+
+def unregister_process(proc):
+    with active_processes_lock:
+        if proc in active_processes:
+            active_processes.remove(proc)
+
+def cancel_active_processes():
+    with active_processes_lock:
+        procs = list(active_processes)
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.terminate()
+        except Exception:
+            pass
+
+def _require_caption_deps():
     try:
-        from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer  # type: ignore
+        import transformers  # type: ignore  # noqa: F401
+        import PIL  # type: ignore  # noqa: F401
     except ImportError:
         raise RuntimeError(
             "Auto-caption dependencies are missing.\n"
@@ -39,16 +56,52 @@ def load_caption_model():
             "After installing, restart Musubi Tuner and try auto-caption again."
         )
 
+def load_vit_gpt2_caption_model():
+    """
+    Lazy-load a lightweight image captioning model (ViT-GPT2).
+    """
+    global caption_vit_model, caption_vit_feature_extractor, caption_vit_tokenizer
+    if (
+        caption_vit_model is not None
+        and caption_vit_feature_extractor is not None
+        and caption_vit_tokenizer is not None
+    ):
+        return caption_vit_model, caption_vit_feature_extractor, caption_vit_tokenizer
+
+    _require_caption_deps()
+
+    from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer  # type: ignore
     import torch
 
-    model_id = os.environ.get("CAPTION_MODEL_ID", "nlpconnect/vit-gpt2-image-captioning")
+    model_id = os.environ.get("CAPTION_MODEL_ID_VIT", "nlpconnect/vit-gpt2-image-captioning")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    caption_model = VisionEncoderDecoderModel.from_pretrained(model_id).to(device)
-    caption_feature_extractor = ViTImageProcessor.from_pretrained(model_id)
-    caption_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    caption_vit_model = VisionEncoderDecoderModel.from_pretrained(model_id).to(device)
+    caption_vit_feature_extractor = ViTImageProcessor.from_pretrained(model_id)
+    caption_vit_tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    return caption_model, caption_feature_extractor, caption_tokenizer
+    return caption_vit_model, caption_vit_feature_extractor, caption_vit_tokenizer
+
+def load_blip_caption_model():
+    """
+    Lazy-load a more descriptive BLIP image captioning model.
+    """
+    global caption_blip_model, caption_blip_processor
+    if caption_blip_model is not None and caption_blip_processor is not None:
+        return caption_blip_model, caption_blip_processor
+
+    _require_caption_deps()
+
+    from transformers import BlipProcessor, BlipForConditionalGeneration  # type: ignore
+    import torch
+
+    model_id = os.environ.get("CAPTION_MODEL_ID_BLIP", "Salesforce/blip-image-captioning-large")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    caption_blip_model = BlipForConditionalGeneration.from_pretrained(model_id).to(device)
+    caption_blip_processor = BlipProcessor.from_pretrained(model_id)
+
+    return caption_blip_model, caption_blip_processor
 
 DOWNLOADS = {
     "DiT Model": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_bf16.safetensors?download=true",
@@ -135,11 +188,16 @@ HTML = '''
           </div>
         </div>
       <button type="button" id="autocap-btn" onclick="autoCaptionCaptionModel()">
-        Auto-caption images (ViT-GPT2)
+        Auto-caption images (ViT-GPT2 / BLIP)
       </button>
       <small style="color:#888; display:block; margin-top:4px;">
         First run will download and load the captioning model and can take a while. Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works (see the GUI README for the exact <code>pip install</code> command).
       </small>
+      <label style="margin-top:8px;">Caption model (auto-caption)</label>
+      <select id="caption_model" name="caption_model">
+        <option value="vit-gpt2" selected>ViT-GPT2 – fast, lightweight</option>
+        <option value="blip-large">BLIP large – more detailed (slower, more VRAM)</option>
+      </select>
       <div id="autocap-status" class="status-box" style="display:none;"></div>
         <input type="hidden" name="uploaded_count" id="uploaded_count">
       </div>
@@ -235,6 +293,7 @@ HTML = '''
         </div>
         <div class="button-row">
           <button type="button" id="start-btn" onclick="startTraining()">Start training</button>
+          <button type="button" id="cancel-btn" onclick="cancelTraining()">Cancel training</button>
           <button type="submit" id="saveyaml-btn" name="action" value="saveyaml">Save configuration as YAML</button>
           <button type="submit" id="loadyaml-btn" name="action" value="loadyaml">Load last YAML config</button>
         </div>
@@ -288,9 +347,11 @@ HTML = '''
       document.getElementById("output-container").style.display = "block";
       document.getElementById("output-text").textContent = "";
       const startBtn = document.getElementById("start-btn");
+      const cancelBtn = document.getElementById("cancel-btn");
       const saveYamlBtn = document.getElementById("saveyaml-btn");
       const loadYamlBtn = document.getElementById("loadyaml-btn");
       if (startBtn) startBtn.disabled = true;
+      if (cancelBtn) cancelBtn.disabled = false;
       if (saveYamlBtn) saveYamlBtn.disabled = true;
       if (loadYamlBtn) loadYamlBtn.disabled = true;
     }
@@ -533,6 +594,10 @@ HTML = '''
         for (let i = 0; i < files.length; i++) {
           fd.append('images', files[i], files[i].name);
         }
+        const modelSelect = document.getElementById('caption_model');
+        if (modelSelect) {
+          fd.append('caption_model', modelSelect.value || 'vit-gpt2');
+        }
 
         const resp = await fetch('/autocaption', {
           method: 'POST',
@@ -647,9 +712,11 @@ HTML = '''
             eventSource = null;
           }
           const startBtn = document.getElementById("start-btn");
+          const cancelBtn = document.getElementById("cancel-btn");
           const saveYamlBtn = document.getElementById("saveyaml-btn");
           const loadYamlBtn = document.getElementById("loadyaml-btn");
           if (startBtn) startBtn.disabled = false;
+          if (cancelBtn) cancelBtn.disabled = true;
           if (saveYamlBtn) saveYamlBtn.disabled = false;
           if (loadYamlBtn) loadYamlBtn.disabled = false;
           const outputContainer = document.getElementById("output-container");
@@ -665,9 +732,11 @@ HTML = '''
           eventSource = null;
           // Re‑enable buttons after training
           const startBtn = document.getElementById("start-btn");
+          const cancelBtn = document.getElementById("cancel-btn");
           const saveYamlBtn = document.getElementById("saveyaml-btn");
           const loadYamlBtn = document.getElementById("loadyaml-btn");
           if (startBtn) startBtn.disabled = false;
+          if (cancelBtn) cancelBtn.disabled = true;
           if (saveYamlBtn) saveYamlBtn.disabled = false;
           if (loadYamlBtn) loadYamlBtn.disabled = false;
           // Show completion highlight
@@ -710,6 +779,23 @@ HTML = '''
       .catch(error => {
         document.getElementById("output-text").textContent += "❌ Network error when starting training: " + error + "\\n";
       });
+    }
+
+    async function cancelTraining() {
+      const confirmCancel = window.confirm("Are you sure you want to cancel the current training run?");
+      if (!confirmCancel) return;
+      const statusEl = document.getElementById('autocap-status');
+      try {
+        const resp = await fetch('/cancel_training', { method: 'POST' });
+        if (!resp.ok) {
+          const text = await resp.text();
+          if (statusEl) statusEl.textContent = "Cancel request failed: " + text;
+          return;
+        }
+        if (statusEl) statusEl.textContent = "Training cancel request sent. Waiting for processes to stop...";
+      } catch (err) {
+        if (statusEl) statusEl.textContent = "Cancel request error: " + err;
+      }
     }
     
     // Auto-start streaming when page loads with training in progress
@@ -760,7 +846,7 @@ def ensure_dir(d):
     if not os.path.isdir(d):
         os.makedirs(d)
 
-def save_uploaded_images(files, captions, output_dir):
+def save_uploaded_images(files, captions, output_dir, trigger_word=""):
     ensure_dir(output_dir)
     img_files = []
     for idx, fileobj in enumerate(files):
@@ -769,8 +855,14 @@ def save_uploaded_images(files, captions, output_dir):
         fileobj.save(filepath)
         caption_file = os.path.join(output_dir, os.path.splitext(fname)[0] + ".txt")
         cap = captions[idx] if idx < len(captions) else ""
+        full_caption = (cap or "").strip()
+        tw = (trigger_word or "").strip()
+        if tw:
+            # Only prepend trigger word if it's not already present (case-insensitive)
+            if tw.lower() not in full_caption.lower():
+                full_caption = f"{tw} {full_caption}".strip()
         with open(caption_file, "w", encoding="utf-8") as cf:
-            cf.write(cap.strip())
+            cf.write(full_caption)
         img_files.append(fname)
     return img_files
 
@@ -807,8 +899,9 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
         "--vae", vae_model
     ]
     if stream_output:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=0, universal_newlines=True)
+        register_process(proc)
         output = ""
         import sys
         try:
@@ -855,6 +948,8 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
                 proc.terminate()
                 proc.wait()
             raise
+        finally:
+            unregister_process(proc)
         return output
     else:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=36000)
@@ -874,8 +969,9 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
     if int(str(vram_profile)) <= 12 or str(vram_profile) == "12":
         cmd.append("--fp8_vl")
     if stream_output:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=0, universal_newlines=True)
+        register_process(proc)
         output = ""
         import sys
         try:
@@ -922,6 +1018,8 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
                 proc.terminate()
                 proc.wait()
             raise
+        finally:
+            unregister_process(proc)
         return output
     else:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=36000)
@@ -942,8 +1040,15 @@ def autocaption():
     if not files:
         return jsonify({"error": "No images provided"}), 400
 
+    caption_model_choice = (request.form.get("caption_model") or "vit-gpt2").strip().lower()
+
     try:
-        model, feature_extractor, tokenizer = load_caption_model()
+        if caption_model_choice == "blip-large":
+            model, processor = load_blip_caption_model()
+            model_type = "blip"
+        else:
+            model, feature_extractor, tokenizer = load_vit_gpt2_caption_model()
+            model_type = "vit-gpt2"
     except RuntimeError as e:
         return jsonify({
             "error": str(e),
@@ -981,24 +1086,49 @@ def autocaption():
             captions.append("")
             continue
 
-        pixel_values = feature_extractor(images=[image], return_tensors="pt").pixel_values.to(device)
+        if model_type == "blip":
+            inputs = processor(images=image, return_tensors="pt").to(device)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=96,
+                    num_beams=6,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    early_stopping=True,
+                )
+            caption = processor.decode(output_ids[0], skip_special_tokens=True).strip()
+        else:
+            pixel_values = feature_extractor(images=[image], return_tensors="pt").pixel_values.to(device)
+            with torch.no_grad():
+                # Use a longer, more descriptive caption with stronger beam search
+                output_ids = model.generate(
+                    pixel_values,
+                    max_length=96,
+                    min_length=20,
+                    num_beams=6,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    early_stopping=True,
+                )
+            caption = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
 
-        with torch.no_grad():
-            # Use a longer, more descriptive caption with stronger beam search
-            output_ids = model.generate(
-                pixel_values,
-                max_length=96,
-                min_length=20,
-                num_beams=6,
-                no_repeat_ngram_size=3,
-                length_penalty=1.2,
-                early_stopping=True,
-            )
-
-        caption = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
         captions.append(caption)
 
     return jsonify({"captions": captions})
+
+@app.route("/cancel_training", methods=["POST"])
+def cancel_training():
+    """
+    Request cancellation of any active training / caching subprocesses.
+    This is best-effort: we send terminate() to known child processes.
+    """
+    cancel_active_processes()
+    output_queue.put("\n" + "="*60 + "\n")
+    output_queue.put("⏹ TRAINING CANCEL REQUEST RECEIVED. Attempting to stop processes...\n")
+    output_queue.put("="*60 + "\n")
+    output_queue.put("[TRAINING_FINISHED]\n")
+    return jsonify({"status": "ok"})
 
 @app.route("/uploads/<filename>")
 def uploaded_image(filename):
@@ -1191,8 +1321,8 @@ def gui():
                 if not files:
                     output_txt = "ERROR: No images were uploaded. Please select at least one image file before starting training."
                 else:
-                    # Save uploaded images first
-                    img_files = save_uploaded_images(files, captions, output_dir)
+                    # Save uploaded images first (include trigger word in caption files)
+                    img_files = save_uploaded_images(files, captions, output_dir, trigger)
                     if not img_files:
                         output_txt = "ERROR: Failed to save uploaded images. Please check file permissions and try again."
                     else:
@@ -1280,8 +1410,9 @@ def gui():
                                     log_file.write("="*60 + "\n\n")
                                     log_file.flush()
                                     
-                                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                            text=True, env=env, bufsize=0, universal_newlines=True)
+                                    register_process(proc)
                                     import sys
                                     try:
                                         for line in iter(proc.stdout.readline, ''):
@@ -1346,6 +1477,7 @@ def gui():
                                         log_file.write("="*60 + "\n")
                                     log_file.write(f"\nTraining finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                                     log_file.flush()
+                                unregister_process(proc)
                                 output_queue.put("[TRAINING_FINISHED]\n")  # Signal to close connection
                             except Exception as e:
                                 output_queue.put("\n" + "="*60 + "\n")
@@ -1372,7 +1504,7 @@ def gui():
             else:
                 # For non-train actions, still show uploaded images if any
                 if files:
-                    img_files = save_uploaded_images(files, captions, output_dir)
+                    img_files = save_uploaded_images(files, captions, output_dir, trigger)
                     for idx, fname in enumerate(img_files):
                         cap = captions[idx] if idx < len(captions) else ""
                         uploaded_gallery.append((fname, cap))

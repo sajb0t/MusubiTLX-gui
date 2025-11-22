@@ -568,15 +568,18 @@ HTML = '''
 
       const btn = document.getElementById('autocap-btn');
       const statusEl = document.getElementById('autocap-status');
+      const modelSelect = document.getElementById('caption_model');
+      const selectedModelValue = modelSelect ? (modelSelect.value || 'vit-gpt2') : 'vit-gpt2';
+      const runningModelName = selectedModelValue === 'blip-large' ? 'BLIP large' : 'ViT-GPT2';
       if (btn) {
         btn.disabled = true;
-        btn.textContent = "Auto-captioning with ViT-GPT2...";
+        btn.textContent = "Auto-captioning with " + runningModelName + "...";
       }
 
         if (statusEl) {
         autoCapStart = Date.now();
         statusEl.style.display = "block";
-        statusEl.textContent = "Preparing auto-captioning... If this is the first run, the model will be downloaded. Please wait.";
+        statusEl.textContent = "Preparing auto-captioning with " + runningModelName + "... If this is the first run, the model will be downloaded. Please wait.";
 
         if (autoCapTimer) {
           clearInterval(autoCapTimer);
@@ -594,9 +597,9 @@ HTML = '''
         for (let i = 0; i < files.length; i++) {
           fd.append('images', files[i], files[i].name);
         }
-        const modelSelect = document.getElementById('caption_model');
-        if (modelSelect) {
-          fd.append('caption_model', modelSelect.value || 'vit-gpt2');
+        const modelSelect2 = document.getElementById('caption_model');
+        if (modelSelect2) {
+          fd.append('caption_model', modelSelect2.value || 'vit-gpt2');
         }
 
         const resp = await fetch('/autocaption', {
@@ -650,7 +653,7 @@ HTML = '''
         autoCapStart = null;
         if (btn) {
           btn.disabled = false;
-          btn.textContent = "Auto-caption images (ViT-GPT2)";
+          btn.textContent = "Auto-caption images (ViT-GPT2 / BLIP)";
         }
       }
     }
@@ -1089,12 +1092,13 @@ def autocaption():
         if model_type == "blip":
             inputs = processor(images=image, return_tensors="pt").to(device)
             with torch.no_grad():
+                # Use a longer, more descriptive caption with stronger beam search for BLIP
                 output_ids = model.generate(
                     **inputs,
-                    max_new_tokens=96,
-                    num_beams=6,
+                    max_new_tokens=128,
+                    num_beams=8,
                     no_repeat_ngram_size=3,
-                    length_penalty=1.2,
+                    length_penalty=1.3,
                     early_stopping=True,
                 )
             caption = processor.decode(output_ids[0], skip_special_tokens=True).strip()

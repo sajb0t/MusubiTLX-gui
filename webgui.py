@@ -1,5 +1,5 @@
-from flask import Flask, render_template_string, request, send_file, Response, stream_with_context
-import subprocess, os, yaml, urllib.request, urllib.parse
+from flask import Flask, render_template_string, request, send_file, Response, stream_with_context, jsonify
+import subprocess, os, yaml, urllib.request, urllib.parse, shlex
 from werkzeug.utils import secure_filename
 import toml
 import threading
@@ -13,6 +13,42 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 # Global queue for streaming output
 output_queue = queue.Queue()
+
+# Globals for optional auto-captioning (ViT-GPT2)
+caption_model = None
+caption_feature_extractor = None
+caption_tokenizer = None
+
+def load_caption_model():
+    """
+    Lazy-load a lightweight image captioning model (ViT-GPT2).
+    If dependencies are missing, raise a RuntimeError with clear instructions
+    instead of crashing the whole app.
+    """
+    global caption_model, caption_feature_extractor, caption_tokenizer
+    if caption_model is not None and caption_feature_extractor is not None and caption_tokenizer is not None:
+        return caption_model, caption_feature_extractor, caption_tokenizer
+
+    try:
+        from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "Auto-caption dependencies are missing.\n"
+            "Please install them in your Musubi Tuner virtual environment:\n"
+            "  pip install \"transformers>=4.44.0\" pillow\n"
+            "After installing, restart Musubi Tuner and try auto-caption again."
+        )
+
+    import torch
+
+    model_id = os.environ.get("CAPTION_MODEL_ID", "nlpconnect/vit-gpt2-image-captioning")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    caption_model = VisionEncoderDecoderModel.from_pretrained(model_id).to(device)
+    caption_feature_extractor = ViTImageProcessor.from_pretrained(model_id)
+    caption_tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    return caption_model, caption_feature_extractor, caption_tokenizer
 
 DOWNLOADS = {
     "DiT Model": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_bf16.safetensors?download=true",
@@ -61,6 +97,8 @@ HTML = '''
     .imgbox { background:#151618; border-radius:13px; box-shadow:0 0 8px #444 inset; padding:13px; text-align:center; width:190px;}
     .imgbox img { max-width:170px; max-height:170px; border-radius:7px; box-shadow:0 0 7px #262f2a;}
     .imgbox input[type=text] { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border: 1px solid #666; }
+    .caption-textarea { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.25; min-height:3.2em; resize:vertical; }
+    .advanced-textarea { width:96%; background:#1e2023; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.3; min-height:6em; }
     .title { font-size:2.1em; color:#a1e6ff; letter-spacing:1px; margin-bottom:0.3em; text-align:left;}
     .model-list { margin-bottom: 15px; }
     .model-list form { display: inline; }
@@ -68,6 +106,8 @@ HTML = '''
     .footer { margin-top: 24px; font-size: 0.9em; color:#999; text-align:right; }
     .footer a { color:#7abfff; text-decoration:none; margin-left:12px; }
     .footer a:hover { text-decoration:underline; }
+    .status-box { margin-top:8px; font-size:0.9em; color:#b3daff; }
+    .cmd-preview { background:#111317; border-radius:8px; padding:8px 10px; margin-top:6px; font-size:0.9em; color:#d8f4ff; max-height:140px; overflow-y:auto; white-space:pre-wrap; }
   </style>
 </head>
 <body>
@@ -94,6 +134,13 @@ HTML = '''
             Drag &amp; drop images here or use the file picker above.
           </div>
         </div>
+      <button type="button" id="autocap-btn" onclick="autoCaptionCaptionModel()">
+        Auto-caption images (ViT-GPT2)
+      </button>
+      <small style="color:#888; display:block; margin-top:4px;">
+        First run will download and load the captioning model and can take a while. Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works (see the GUI README for the exact <code>pip install</code> command).
+      </small>
+      <div id="autocap-status" class="status-box" style="display:none;"></div>
         <input type="hidden" name="uploaded_count" id="uploaded_count">
       </div>
       <div class="section">
@@ -164,6 +211,23 @@ HTML = '''
             <label>LoRA filename (.safetensors)</label>
             <input name="output_name" type="text" value="{{output_name}}" placeholder="lora" required>
             <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 4px;">Final LoRA file: <code>output/{{output_dir}}/{{output_name}}.safetensors</code></small>
+          </div>
+          <div class="field-group field-group-wide">
+            <button type="button" id="advanced-toggle" onclick="toggleAdvancedFlags()">
+              Show advanced trainer flags
+            </button>
+            <div id="advanced-flags-panel" style="display:none; margin-top:10px;">
+              <label>Advanced trainer flags (optional)</label>
+              <textarea name="advanced_flags" class="advanced-textarea" rows="5" placeholder="Example: --network_dropout 0.05 --max_grad_norm 0.5">{{advanced_flags}}</textarea>
+              <small style="color:#888; display:block; margin-top:4px;">
+                These are the extra flags that will be passed to the trainer (including VRAM-related flags). You can edit them directly if you know what you are doing.
+              </small>
+              <label style="margin-top:10px;">Effective training command (preview)</label>
+              <pre id="cmd-preview" class="cmd-preview"></pre>
+              <small style="color:#777; display:block; margin-top:4px;">
+                Read-only preview of the <code>python qwen_image_train_network.py</code> command that will be used when you click "Start training".
+              </small>
+            </div>
           </div>
         </div>
         <div style="color:#aaa; font-size:0.9em; margin-bottom:6px; margin-top:4px;">
@@ -300,7 +364,7 @@ HTML = '''
             var div = document.createElement('div');
             div.className = "imgbox";
             div.innerHTML = '<img><br>' +
-                '<input type="text" name="caption_' + i + '" placeholder="Caption for image ' + (i + 1) + '" style="width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border: 1px solid #666;">';
+                '<textarea class="caption-textarea" name="caption_' + i + '" rows="2" placeholder="Caption for image ' + (i + 1) + '"></textarea>';
             let imgEl = div.querySelector('img');
             preview.appendChild(div);
 
@@ -314,7 +378,218 @@ HTML = '''
         }
         updateEstimate();
     }
-    
+
+    let autoCapTimer = null;
+    let autoCapStart = null;
+
+    let advFlagsDirty = false;
+
+    function toggleAdvancedFlags() {
+      const panel = document.getElementById('advanced-flags-panel');
+      const toggle = document.getElementById('advanced-toggle');
+      if (!panel || !toggle) return;
+      const visible = panel.style.display === "block";
+      panel.style.display = visible ? "none" : "block";
+      toggle.textContent = visible ? "Show advanced trainer flags" : "Hide advanced trainer flags";
+    }
+
+    function buildDefaultExtraFlags(vramProfile) {
+      if (vramProfile === "12") {
+        return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing --gradient_checkpointing_cpu_offload";
+      }
+      if (vramProfile === "16") {
+        return "--fp8_base --fp8_scaled --blocks_to_swap 16 --gradient_checkpointing";
+      }
+      if (vramProfile === "24") {
+        return "--gradient_checkpointing";
+      }
+      return "";
+    }
+
+    function syncAdvancedFlagsFromGui(initial) {
+      const advFlagsInput = document.querySelector('textarea[name="advanced_flags"]');
+      const vramSelect = document.querySelector('select[name="vram_profile"]');
+      if (!advFlagsInput || !vramSelect) return;
+
+      // Do not override user edits once they have started typing (unless this is initial fill and field is empty)
+      if (!initial && advFlagsDirty) {
+        return;
+      }
+
+      const vramProfile = vramSelect.value || "12";
+      const defaults = buildDefaultExtraFlags(vramProfile);
+
+      if (initial) {
+        // Only fill if empty so existing YAML-loaded value is preserved
+        if (!advFlagsInput.value || advFlagsInput.value.trim() === "") {
+          advFlagsInput.value = defaults;
+        }
+      } else {
+        advFlagsInput.value = defaults;
+      }
+      updateCommandPreview();
+    }
+
+    function updateCommandPreview() {
+      const preview = document.getElementById('cmd-preview');
+      if (!preview) return;
+
+      const vramSelect = document.querySelector('select[name="vram_profile"]');
+      const epochsInput = document.querySelector('input[name="epochs"]');
+      const batchInput = document.querySelector('input[name="batch_size"]');
+      const lrInput = document.querySelector('input[name="lr"]');
+      const rankInput = document.querySelector('input[name="rank"]');
+      const dimsInput = document.querySelector('input[name="dims"]');
+      const seedInput = document.querySelector('input[name="seed"]');
+      const resInput = document.querySelector('input[name="resolution"]');
+      const outDirInput = document.querySelector('input[name="output_dir"]');
+      const outNameInput = document.querySelector('input[name="output_name"]');
+      const optSelect = document.querySelector('select[name="optimizer_type"]');
+      const advFlagsInput = document.querySelector('textarea[name="advanced_flags"]');
+
+      const vramProfile = vramSelect ? (vramSelect.value || "12") : "12";
+      const epochs = epochsInput ? (epochsInput.value || "6") : "6";
+      const batchSize = batchInput ? (batchInput.value || "1") : "1";
+      const lr = lrInput ? (lrInput.value || "5e-5") : "5e-5";
+      const rank = rankInput ? (rankInput.value || "16") : "16";
+      const dims = dimsInput ? (dimsInput.value || "128") : "128";
+      const seed = seedInput ? (seedInput.value || "42") : "42";
+      const resolution = resInput ? (resInput.value || "1024x1024") : "1024x1024";
+      const userOutDir = outDirInput ? (outDirInput.value || "") : "";
+      const outputName = outNameInput ? (outNameInput.value || "lora") : "lora";
+      const optimizer = optSelect ? (optSelect.value || "AdamW") : "AdamW";
+      const advFlagsText = advFlagsInput ? (advFlagsInput.value || "") : "";
+
+      const baseOutput = "output";
+      const finalOutDir = userOutDir ? (baseOutput + "/" + userOutDir) : baseOutput;
+      const datasetConfig = finalOutDir + "/dataset_config.toml";
+
+      const ditModel = "qwen_image_bf16.safetensors";
+      const vaeModel = "diffusion_pytorch_model.safetensors";
+      const textEncoder = "qwen_2.5_vl_7b.safetensors";
+
+      let cmdParts = [
+        "python", "src/musubi_tuner/qwen_image_train_network.py",
+        "--dit", ditModel,
+        "--vae", vaeModel,
+        "--text_encoder", textEncoder,
+        "--dataset_config", datasetConfig,
+        "--max_train_epochs", String(epochs),
+        "--save_every_n_epochs", "1",
+        "--learning_rate", String(lr),
+        "--network_dim", String(rank),
+        "--network_alpha", String(dims),
+        "--seed", String(seed),
+        "--output_dir", finalOutDir,
+        "--output_name", outputName,
+        "--network_module", "networks.lora_qwen_image",
+        "--optimizer_type", optimizer,
+        "--mixed_precision", "bf16",
+        "--sdpa"
+      ];
+
+      if (advFlagsText.trim() !== "") {
+        const extra = advFlagsText.trim().split(/\s+/);
+        cmdParts = cmdParts.concat(extra);
+      }
+
+      const cmdString = cmdParts.map(p => (/\s/.test(p) ? `"${p}"` : p)).join(" ");
+      preview.textContent = cmdString;
+    }
+
+    async function autoCaptionCaptionModel() {
+      const fileInput = document.getElementById('images');
+      const files = fileInput && fileInput.files ? fileInput.files : null;
+      if (!files || !files.length) {
+        alert("Please select or drop images first before auto-captioning.");
+        return;
+      }
+
+      const btn = document.getElementById('autocap-btn');
+      const statusEl = document.getElementById('autocap-status');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Auto-captioning with ViT-GPT2...";
+      }
+
+        if (statusEl) {
+        autoCapStart = Date.now();
+        statusEl.style.display = "block";
+        statusEl.textContent = "Preparing auto-captioning... If this is the first run, the model will be downloaded. Please wait.";
+
+        if (autoCapTimer) {
+          clearInterval(autoCapTimer);
+        }
+        autoCapTimer = setInterval(() => {
+          if (!autoCapStart) return;
+          const elapsedSec = Math.round((Date.now() - autoCapStart) / 1000);
+          statusEl.textContent = "Caption model is working"
+            + (elapsedSec > 0 ? ` (elapsed ~${elapsedSec}s). First run may take several minutes while the model downloads.` : "...");
+        }, 2000);
+      }
+
+      try {
+        const fd = new FormData();
+        for (let i = 0; i < files.length; i++) {
+          fd.append('images', files[i], files[i].name);
+        }
+
+        const resp = await fetch('/autocaption', {
+          method: 'POST',
+          body: fd
+        });
+
+        let data = null;
+        try {
+          data = await resp.json();
+        } catch (e) {
+          throw new Error("Server returned a non-JSON response.");
+        }
+
+        if (!resp.ok) {
+          const msg = data && data.error ? data.error : resp.statusText;
+          if (statusEl) statusEl.textContent = "Autocaption error: " + msg;
+          return;
+        }
+
+        if (data.missing_dependencies) {
+          const msg = data.error || "Captioning dependencies are missing. Please install them in your environment.";
+          if (statusEl) statusEl.textContent = msg;
+          return;
+        }
+
+        if (!data.captions || !Array.isArray(data.captions)) {
+          if (statusEl) statusEl.textContent = "Autocaption response was invalid.";
+          return;
+        }
+
+        data.captions.forEach((cap, idx) => {
+          const field = document.querySelector('[name=\"caption_' + idx + '\"]');
+          if (field && (!field.value || field.value.trim() === \"\")) {
+            field.value = cap;
+          }
+        });
+
+        if (statusEl) {
+          const count = data.captions.length;
+          statusEl.textContent = `Auto-captioning finished successfully for ${count} image(s).`;
+        }
+      } catch (err) {
+        console.error(err);
+        if (statusEl) statusEl.textContent = "Autocaption request failed: " + err.message;
+      } finally {
+        if (autoCapTimer) {
+          clearInterval(autoCapTimer);
+          autoCapTimer = null;
+        }
+        autoCapStart = null;
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Auto-caption images (ViT-GPT2)";
+        }
+      }
+    }
+
     function setupDropzone() {
         const dropArea = document.getElementById('preview');
         const fileInput = document.getElementById('images');
@@ -444,6 +719,37 @@ HTML = '''
         startTraining();
       }
       setupDropzone();
+      // Attach listeners to keep command preview in sync with form values
+      const names = [
+        "epochs","batch_size","image_repeats","lr","resolution",
+        "seed","rank","dims","output_dir","output_name"
+      ];
+      names.forEach(n => {
+        const el = document.querySelector('input[name=\"' + n + '\"]');
+        if (el) {
+          el.addEventListener('input', updateCommandPreview);
+          el.addEventListener('change', updateCommandPreview);
+        }
+      });
+      const vramSel = document.querySelector('select[name=\"vram_profile\"]');
+      if (vramSel) {
+        vramSel.addEventListener('change', function() {
+          syncAdvancedFlagsFromGui(false);
+        });
+      }
+      const optSel = document.querySelector('select[name=\"optimizer_type\"]');
+      if (optSel) {
+        optSel.addEventListener('change', updateCommandPreview);
+      }
+      const advFlags = document.querySelector('textarea[name=\"advanced_flags\"]');
+      if (advFlags) {
+        advFlags.addEventListener('input', function() {
+          advFlagsDirty = true;
+          updateCommandPreview();
+        });
+      }
+      syncAdvancedFlagsFromGui(true);
+      updateCommandPreview();
     });
   </script>
 </body>
@@ -625,6 +931,75 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
             log_file.flush()
         return result
 
+@app.route("/autocaption", methods=["POST"])
+def autocaption():
+    """
+    Auto-caption uploaded images using a lightweight captioning model, if available.
+    If transformers / pillow are missing, return a JSON error
+    with clear installation instructions instead of crashing the app.
+    """
+    files = request.files.getlist("images")
+    if not files:
+        return jsonify({"error": "No images provided"}), 400
+
+    try:
+        model, feature_extractor, tokenizer = load_caption_model()
+    except RuntimeError as e:
+        return jsonify({
+            "error": str(e),
+            "missing_dependencies": True
+        }), 500
+    except Exception as e:
+        return jsonify({"error": f"Failed to initialize caption model: {e}"}), 500
+
+    try:
+        from PIL import Image  # type: ignore
+        import io
+        import torch
+    except ImportError:
+        return jsonify({
+            "error": (
+                "Pillow dependency is missing.\n"
+                "Please install it in your virtual environment:\n"
+                "  pip install pillow"
+            ),
+            "missing_dependencies": True
+        }), 500
+
+    device = next(model.parameters()).device
+    captions = []
+
+    for fileobj in files:
+        image_bytes = fileobj.read()
+        if not image_bytes:
+            captions.append("")
+            continue
+
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception:
+            captions.append("")
+            continue
+
+        pixel_values = feature_extractor(images=[image], return_tensors="pt").pixel_values.to(device)
+
+        with torch.no_grad():
+            # Use a longer, more descriptive caption with stronger beam search
+            output_ids = model.generate(
+                pixel_values,
+                max_length=96,
+                min_length=20,
+                num_beams=6,
+                no_repeat_ngram_size=3,
+                length_penalty=1.2,
+                early_stopping=True,
+            )
+
+        caption = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        captions.append(caption)
+
+    return jsonify({"captions": captions})
+
 @app.route("/uploads/<filename>")
 def uploaded_image(filename):
     return send_file(os.path.join(app.config["UPLOAD_FOLDER"], filename))
@@ -687,6 +1062,7 @@ def gui():
     rank = 16
     dims = 128
     image_repeats = 10
+    advanced_flags = ""
     output_dir = ""  # Empty means use default "output" directory
     output_name = "lora"
     saved_yaml = ""
@@ -721,6 +1097,7 @@ def gui():
             dims = request.form.get("dims", dims)
             optimizer_type = request.form.get("optimizer_type", "AdamW")
             output_name = request.form.get("output_name", output_name)
+            advanced_flags = request.form.get("advanced_flags", advanced_flags)
             # Always use "output" as base directory, and create subdirectory if specified
             base_output_dir = "output"
             user_output_dir = request.form.get("output_dir", "").strip()
@@ -753,6 +1130,7 @@ def gui():
                         dims = cfg.get("lora_dims", dims)
                         output_dir = cfg.get("output_dir", output_dir)
                         output_name = cfg.get("output_name", output_name)
+                        advanced_flags = cfg.get("advanced_flags", advanced_flags)
                         # Optional: image_repeats, if present
                         if "image_repeats" in cfg:
                             image_repeats = cfg.get("image_repeats", image_repeats)
@@ -797,29 +1175,11 @@ def gui():
                 output_name=output_name,
                 dit_model=dit_model,
                 vae_model=vae_model,
-                text_encoder=text_encoder
+                text_encoder=text_encoder,
+                advanced_flags=str(advanced_flags or ""),
             )
+            # Extra args are now fully controlled by the Advanced flags textarea (kept in sync with VRAM profile by JS)
             extra_args = []
-            if vram_profile == "12":
-                # Aggressive VRAM saving: fp8, large block swap, gradient checkpointing + CPU offload of activations
-                extra_args += [
-                    "--fp8_base", "--fp8_scaled",
-                    "--blocks_to_swap", "45",
-                    "--gradient_checkpointing",
-                    "--gradient_checkpointing_cpu_offload",
-                ]
-            elif vram_profile == "16":
-                # Standard VRAM saving: fp8, some block swap, gradient checkpointing (no CPU offload)
-                extra_args += [
-                    "--fp8_base", "--fp8_scaled",
-                    "--blocks_to_swap", "16",
-                    "--gradient_checkpointing",
-                ]
-            elif vram_profile == "24":
-                # High VRAM: no fp8 or block swap, only gradient checkpointing for safety
-                extra_args += [
-                    "--gradient_checkpointing",
-                ]
             if action == "saveyaml":
                 yaml_path = "configs/last_config.yaml"
                 os.makedirs("configs", exist_ok=True)
@@ -896,6 +1256,17 @@ def gui():
                             "--mixed_precision", "bf16",  # Recommended for Qwen-Image
                             "--sdpa"  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
                         ] + extra_args
+
+                        # Append any manually specified advanced flags from the GUI
+                        manual_flags = []
+                        if advanced_flags:
+                            try:
+                                manual_flags = shlex.split(str(advanced_flags))
+                            except ValueError:
+                                # Fallback: simple whitespace split if user entered something odd
+                                manual_flags = str(advanced_flags).split()
+                        if manual_flags:
+                            cmd += manual_flags
                         env = dict(os.environ)
                         env["CUDA_VISIBLE_DEVICES"] = "0"
                         # Improve CUDA memory handling to reduce fragmentation (helps OOM)
@@ -1011,6 +1382,7 @@ def gui():
         trigger=trigger, vram_profile=vram_profile, epochs=epochs, batch_size=batch_size, lr=lr,
         prompt=prompt, resolution=resolution, seed=seed, rank=rank, dims=dims,
         output_dir=output_dir, output_name=output_name, image_repeats=image_repeats,
+        advanced_flags=advanced_flags,
         saved_yaml=saved_yaml, output_txt=output_txt,
         uploaded_gallery=uploaded_gallery
     )

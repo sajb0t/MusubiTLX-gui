@@ -21,6 +21,26 @@ caption_vit_tokenizer = None
 caption_blip_model = None
 caption_blip_processor = None
 
+
+def _normalize_caption_text(text: str) -> str:
+    """
+    Light cleanup of caption phrasing to make results a bit nicer for training:
+    - Strip leading filler like "there is ...", "there are ...", "this is ..."
+    - Trim whitespace and normalize first letter to uppercase
+    """
+    if not isinstance(text, str):
+        return text
+    t = text.strip()
+    lower = t.lower()
+    prefixes = ["there is ", "there are ", "this is ", "there's "]
+    for p in prefixes:
+        if lower.startswith(p):
+            t = t[len(p) :].lstrip()
+            break
+    if t:
+        t = t[0].upper() + t[1:]
+    return t
+
 # Track active training-related subprocesses so we can cancel them from the UI
 active_processes = []
 active_processes_lock = threading.Lock()
@@ -193,11 +213,20 @@ HTML = '''
       <small style="color:#888; display:block; margin-top:4px;">
         First run will download and load the captioning model and can take a while. Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works (see the GUI README for the exact <code>pip install</code> command).
       </small>
-      <label style="margin-top:8px;">Caption model (auto-caption)</label>
+      <label style="margin-top:8px;">
+        Caption model (auto-caption)
+      </label>
       <select id="caption_model" name="caption_model">
         <option value="vit-gpt2" selected>ViT-GPT2 – fast, lightweight</option>
         <option value="blip-large">BLIP large – more detailed (slower, more VRAM)</option>
       </select>
+      <label style="margin-top:8px;">
+        Caption length
+      </label>
+      <input type="range" id="caption_max_length" name="caption_max_length" min="32" max="192" step="8" value="128" oninput="updateCaptionLengthLabel()">
+      <div style="font-size:0.85em; color:#aaa; margin-top:2px;">
+        Target length: <span id="caption_length_label">128</span> tokens (approximate, longer = more detail)
+      </div>
       <div id="autocap-status" class="status-box" style="display:none;"></div>
         <input type="hidden" name="uploaded_count" id="uploaded_count">
       </div>
@@ -445,6 +474,13 @@ HTML = '''
 
     let advFlagsDirty = false;
 
+    function updateCaptionLengthLabel() {
+      const slider = document.getElementById('caption_max_length');
+      const label = document.getElementById('caption_length_label');
+      if (!slider || !label) return;
+      label.textContent = slider.value;
+    }
+
     function toggleAdvancedFlags() {
       const panel = document.getElementById('advanced-flags-panel');
       const toggle = document.getElementById('advanced-toggle');
@@ -601,6 +637,10 @@ HTML = '''
         if (modelSelect2) {
           fd.append('caption_model', modelSelect2.value || 'vit-gpt2');
         }
+        const lengthSlider = document.getElementById('caption_max_length');
+        if (lengthSlider) {
+          fd.append('caption_max_length', lengthSlider.value || '128');
+        }
 
         const resp = await fetch('/autocaption', {
           method: 'POST',
@@ -691,6 +731,9 @@ HTML = '''
     
     // Live output updates via Server-Sent Events
     let eventSource = null;
+    let sseBuffer = "";
+    let lastSseFlush = 0;
+    const SSE_FLUSH_INTERVAL_MS = 8000; // flush to UI at most ~every 8 seconds
     function startTraining() {
       showSpinner();
       
@@ -749,10 +792,16 @@ HTML = '''
           return;
         }
         
-        // Append each SSE message on its own line for readability
-        const processedData = data;
-        outputText.textContent += processedData + "\\n";
-        outputText.scrollTop = outputText.scrollHeight;
+        // Buffer SSE messages and flush to UI at most every SSE_FLUSH_INTERVAL_MS
+        const processedData = data + "\\n";
+        sseBuffer += processedData;
+        const now = Date.now();
+        if (!lastSseFlush || (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || data.includes("TRAINING ABORTED WITH ERROR") || data.includes("✅ TRAINING COMPLETED!")) {
+          outputText.textContent += sseBuffer;
+          outputText.scrollTop = outputText.scrollHeight;
+          sseBuffer = "";
+          lastSseFlush = now;
+        }
       };
       
       eventSource.onerror = function(event) {
@@ -839,6 +888,7 @@ HTML = '''
       }
       syncAdvancedFlagsFromGui(true);
       updateCommandPreview();
+      updateCaptionLengthLabel();
     });
   </script>
 </body>
@@ -1044,6 +1094,15 @@ def autocaption():
         return jsonify({"error": "No images provided"}), 400
 
     caption_model_choice = (request.form.get("caption_model") or "vit-gpt2").strip().lower()
+    # Optional max length slider from GUI
+    max_len_str = (request.form.get("caption_max_length") or "").strip()
+    try:
+        max_len = int(max_len_str) if max_len_str else 0
+    except ValueError:
+        max_len = 0
+    # Clamp to a safe range; fall back to sensible default if out of range
+    if max_len < 32 or max_len > 192:
+        max_len = 128
 
     try:
         if caption_model_choice == "blip-large":
@@ -1092,30 +1151,32 @@ def autocaption():
         if model_type == "blip":
             inputs = processor(images=image, return_tensors="pt").to(device)
             with torch.no_grad():
-                # Use a longer, more descriptive caption with stronger beam search for BLIP
+                # Encourage longer, detailed but less repetitive captions for BLIP
                 output_ids = model.generate(
                     **inputs,
-                    max_new_tokens=128,
-                    num_beams=8,
+                    max_new_tokens=max_len,
+                    num_beams=6,
                     no_repeat_ngram_size=3,
-                    length_penalty=1.3,
+                    length_penalty=1.1,
                     early_stopping=True,
                 )
-            caption = processor.decode(output_ids[0], skip_special_tokens=True).strip()
+            caption_raw = processor.decode(output_ids[0], skip_special_tokens=True).strip()
+            caption = _normalize_caption_text(caption_raw)
         else:
             pixel_values = feature_extractor(images=[image], return_tensors="pt").pixel_values.to(device)
             with torch.no_grad():
                 # Use a longer, more descriptive caption with stronger beam search
                 output_ids = model.generate(
                     pixel_values,
-                    max_length=96,
-                    min_length=20,
+                    max_length=max_len,
+                    min_length=max(20, max_len // 4),
                     num_beams=6,
                     no_repeat_ngram_size=3,
                     length_penalty=1.2,
                     early_stopping=True,
                 )
-            caption = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+            caption_raw = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+            caption = _normalize_caption_text(caption_raw)
 
         captions.append(caption)
 

@@ -21,3 +21,6 @@ Simple web GUI for training Qwen-Image LoRA models using [Musubi Tuner](https://
 - Open `http://127.0.0.1:5000` in your browser.
 
 ![MusubiTLX GUI](gui.png)
+
+
+![MusubiTLX GUI](example.png)

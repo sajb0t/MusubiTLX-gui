@@ -192,6 +192,18 @@ def load_qwen_vl_caption_model():
 
     return caption_qwen_vl_model, caption_qwen_vl_processor
 
+def get_ram_percent():
+    """
+    Get current RAM usage percentage.
+    Returns None if psutil is not available.
+    """
+    try:
+        import psutil
+        ram = psutil.virtual_memory()
+        return ram.percent
+    except ImportError:
+        return None
+
 def unload_caption_models():
     """
     Unload caption models from memory to free VRAM before training.
@@ -919,8 +931,9 @@ HTML = r'''
     function buildDefaultExtraFlags(vramProfile) {
       // Map user's GPU VRAM to actual training settings
       // 12GB VRAM GPU: Use blocks_to_swap 45 → ~12GB VRAM usage (safest, most offload to RAM)
+      // Note: gradient_checkpointing_cpu_offload is removed to avoid CUDA alignment issues with fp8_scaled
       if (vramProfile === "12") {
-        return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing --gradient_checkpointing_cpu_offload";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing";
       }
       // 16GB VRAM GPU: Use blocks_to_swap 30 → ~16-18GB VRAM usage (balanced, faster than 12GB profile)
       // blocks_to_swap 16 would need 24GB VRAM which doesn't fit on 16GB cards
@@ -2125,7 +2138,13 @@ def gui():
                         env = dict(os.environ)
                         env["CUDA_VISIBLE_DEVICES"] = "0"
                         # Improve CUDA memory handling to reduce fragmentation (helps OOM)
-                        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+                        # Use PYTORCH_ALLOC_CONF instead of deprecated PYTORCH_CUDA_ALLOC_CONF
+                        if "PYTORCH_CUDA_ALLOC_CONF" in env:
+                            # Migrate old setting to new format
+                            old_value = env.pop("PYTORCH_CUDA_ALLOC_CONF")
+                            env.setdefault("PYTORCH_ALLOC_CONF", old_value)
+                        else:
+                            env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
                         
                         def run_training():
                             try:
@@ -2141,8 +2160,60 @@ def gui():
                                                            text=True, env=env, bufsize=0, universal_newlines=True)
                                     register_process(proc)
                                     import sys
+                                    
+                                    # RAM monitoring: check every 10 seconds
+                                    last_ram_check_time = time.time()
+                                    RAM_CHECK_INTERVAL = 10.0  # seconds
+                                    RAM_THRESHOLD_PERCENT = 95.0
+                                    ram_aborted = False
+                                    
                                     try:
                                         for line in iter(proc.stdout.readline, ''):
+                                            # Check RAM usage every RAM_CHECK_INTERVAL seconds
+                                            current_time = time.time()
+                                            if current_time - last_ram_check_time >= RAM_CHECK_INTERVAL:
+                                                last_ram_check_time = current_time
+                                                ram_percent = get_ram_percent()
+                                                if ram_percent is not None and ram_percent > RAM_THRESHOLD_PERCENT:
+                                                    # RAM exceeded threshold - abort training
+                                                    ram_aborted = True
+                                                    error_msg = f"\n" + "="*60 + "\n"
+                                                    error_msg += f"⚠️  CRITICAL: RAM usage is {ram_percent:.1f}% (threshold: {RAM_THRESHOLD_PERCENT}%)\n"
+                                                    error_msg += f"Training aborted to prevent system lockup.\n"
+                                                    error_msg += f"Unloading caption models to free memory...\n"
+                                                    error_msg += "="*60 + "\n"
+                                                    output_queue.put(error_msg)
+                                                    log_file.write(error_msg)
+                                                    log_file.flush()
+                                                    
+                                                    # Unload caption models to free RAM
+                                                    try:
+                                                        unload_caption_models()
+                                                        unload_msg = "Caption models unloaded.\n"
+                                                        output_queue.put(unload_msg)
+                                                        log_file.write(unload_msg)
+                                                        log_file.flush()
+                                                    except Exception as unload_err:
+                                                        unload_err_msg = f"Warning: Error unloading models: {str(unload_err)}\n"
+                                                        output_queue.put(unload_err_msg)
+                                                        log_file.write(unload_err_msg)
+                                                        log_file.flush()
+                                                    
+                                                    # Terminate training process
+                                                    if proc.poll() is None:
+                                                        proc.terminate()
+                                                        # Wait up to 5 seconds for graceful termination
+                                                        try:
+                                                            proc.wait(timeout=5)
+                                                        except subprocess.TimeoutExpired:
+                                                            # Force kill if it doesn't terminate gracefully
+                                                            proc.kill()
+                                                            proc.wait()
+                                                    
+                                                    # Mark return code to indicate RAM abort (process is already terminated)
+                                                    proc.returncode = -99
+                                                    break  # Exit the loop
+                                            
                                             if line:
                                                 # Normalize progress output: replace carriage return with newline
                                                 line = line.replace('\r\n', '\n').replace('\r', '\n')
@@ -2153,9 +2224,24 @@ def gui():
                                                 log_file.flush()
                                                 # Force flush stdout if possible
                                                 sys.stdout.flush()
-                                        proc.wait()
-                                        # Check if process crashed
-                                        if proc.returncode != 0:
+                                        
+                                        # Only wait if process wasn't aborted by RAM monitoring
+                                        if not ram_aborted:
+                                            proc.wait()
+                                        
+                                        # If RAM aborted, skip normal error handling (already handled above)
+                                        if ram_aborted:
+                                            output_queue.put("\n" + "="*60 + "\n")
+                                            output_queue.put("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
+                                            output_queue.put("="*60 + "\n")
+                                            output_queue.put("All caption models have been unloaded from memory.\n")
+                                            log_file.write("\n" + "="*60 + "\n")
+                                            log_file.write("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
+                                            log_file.write("="*60 + "\n")
+                                            log_file.write("All caption models have been unloaded from memory.\n")
+                                            log_file.flush()
+                                        # Check if process crashed (only if not RAM aborted)
+                                        elif proc.returncode != 0:
                                             error_msg = f"\n❌ Process exited with code {proc.returncode}\n"
                                             output_queue.put(error_msg)
                                             log_file.write(error_msg)
@@ -2172,7 +2258,11 @@ def gui():
                                             proc.wait()
                                         raise
                                     
-                                    if proc.returncode == 0:
+                                    # Skip success message if RAM aborted
+                                    if ram_aborted:
+                                        # Already logged above, just mark as finished
+                                        pass
+                                    elif proc.returncode == 0:
                                         output_queue.put("\n" + "="*60 + "\n")
                                         output_queue.put("✅ TRAINING COMPLETED!\n")
                                         output_queue.put("="*60 + "\n")
@@ -2193,7 +2283,7 @@ def gui():
                                             log_file.write(f"And epoch files such as: {epoch_path}\n")
                                         log_file.write(f"Absolute path: {os.path.abspath(final_path)}\n")
                                         log_file.write("="*60 + "\n")
-                                    else:
+                                    elif not ram_aborted:  # Don't show error message if RAM aborted (already handled above)
                                         output_queue.put("\n" + "="*60 + "\n")
                                         output_queue.put(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
                                         output_queue.put("="*60 + "\n")
@@ -2202,7 +2292,10 @@ def gui():
                                         log_file.write("\n" + "="*60 + "\n")
                                         log_file.write(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
                                         log_file.write("="*60 + "\n")
+                                    
                                     log_file.write(f"\nTraining finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                    if ram_aborted:
+                                        log_file.write("Reason: RAM usage exceeded 95% threshold.\n")
                                     log_file.flush()
                                 unregister_process(proc)
                                 output_queue.put("[TRAINING_FINISHED]\n")  # Signal to close connection

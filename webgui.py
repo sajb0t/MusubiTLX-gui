@@ -123,6 +123,53 @@ def load_blip_caption_model():
 
     return caption_blip_model, caption_blip_processor
 
+def unload_caption_models():
+    """
+    Unload caption models from memory to free VRAM before training.
+    This helps prevent out-of-memory errors when training with many images.
+    """
+    global caption_vit_model, caption_vit_feature_extractor, caption_vit_tokenizer
+    global caption_blip_model, caption_blip_processor
+    
+    try:
+        import torch
+    except ImportError:
+        return
+    
+    # Unload ViT-GPT2 model
+    if caption_vit_model is not None:
+        try:
+            if hasattr(caption_vit_model, 'to'):
+                caption_vit_model.to('cpu')
+            del caption_vit_model
+        except Exception:
+            pass
+        caption_vit_model = None
+    
+    if caption_vit_feature_extractor is not None:
+        caption_vit_feature_extractor = None
+    
+    if caption_vit_tokenizer is not None:
+        caption_vit_tokenizer = None
+    
+    # Unload BLIP model
+    if caption_blip_model is not None:
+        try:
+            if hasattr(caption_blip_model, 'to'):
+                caption_blip_model.to('cpu')
+            del caption_blip_model
+        except Exception:
+            pass
+        caption_blip_model = None
+    
+    if caption_blip_processor is not None:
+        caption_blip_processor = None
+    
+    # Clear CUDA cache to free up VRAM
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
 DOWNLOADS = {
     "DiT Model": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_bf16.safetensors?download=true",
     "Text Encoder": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b.safetensors?download=true",
@@ -154,6 +201,13 @@ HTML = '''
     .section { background: #23272E; border-radius:16px; margin-bottom: 24px; padding: 1.25em 1.7em;}
     .section h3 { margin-top:0; color: #86c6fe; font-size: 1.28em; font-weight:600; letter-spacing:0.02em;}
     input, select, textarea { width: 96%; padding: 8px; margin: 6px 0 16px; border-radius: 6px; border: 1px solid #666; background: #1e2023; color: #eee; font-size: 1.09rem;}
+    input[type="file"] { display: none; }
+    .file-input-wrapper { position: relative; width: 96%; }
+    .file-input-label { display: inline-block; padding: 10px 28px; border-radius: 8px; background: #0098FF; color: #fff; border: none; font-size: 1.07em; cursor: pointer; font-weight: 500; margin-bottom: 16px; }
+    .file-input-label:hover { background: #00ddcb; }
+    .file-input-clear-btn { display: inline-block; padding: 8px 20px; border-radius: 6px; background: #666; color: #fff; border: none; font-size: 0.95em; cursor: pointer; font-weight: 500; margin-left: 8px; margin-bottom: 16px; }
+    .file-input-clear-btn:hover { background: #888; }
+    .file-input-text { display: inline-block; margin-left: 12px; color: #aaa; font-size: 0.95em; }
     button { padding: 10px 28px; border-radius: 8px; background: #0098FF; color: #fff; border: none; font-size: 1.07em; cursor:pointer; font-weight:500;}
     button:hover { background: #00ddcb; }
     label { display: block; margin-top: 10px; font-weight: 600;}
@@ -167,10 +221,12 @@ HTML = '''
     .drop-hint { color:#aaa; font-size:0.95em; text-align:center; }
     .imglist.dragover { border-color: #00ddcb; background: rgba(0,221,203,0.04); }
     .gallery { display:flex; flex-wrap:wrap; gap:20px; margin-top:10px;}
-    .imgbox { background:#151618; border-radius:13px; box-shadow:0 0 8px #444 inset; padding:13px; text-align:center; width:190px;}
+    .imgbox { background:#151618; border-radius:13px; box-shadow:0 0 8px #444 inset; padding:13px; text-align:center; width:190px; position:relative;}
     .imgbox img { max-width:170px; max-height:170px; border-radius:7px; box-shadow:0 0 7px #262f2a;}
     .imgbox input[type=text] { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border: 1px solid #666; }
     .caption-textarea { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.25; min-height:3.2em; resize:vertical; }
+    .imgbox-remove { position:absolute; top:5px; right:5px; background:#ff4444; color:#fff; border:none; border-radius:50%; width:24px; height:24px; cursor:pointer; font-size:16px; font-weight:bold; line-height:1; padding:0; display:flex; align-items:center; justify-content:center; opacity:0.8; }
+    .imgbox-remove:hover { opacity:1; background:#ff6666; }
     .advanced-textarea { width:96%; background:#1e2023; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.3; min-height:6em; }
     .title { font-size:2.1em; color:#a1e6ff; letter-spacing:1px; margin-bottom:0.3em; text-align:left;}
     .model-list { margin-bottom: 15px; }
@@ -181,6 +237,15 @@ HTML = '''
     .footer a:hover { text-decoration:underline; }
     .status-box { margin-top:8px; font-size:0.9em; color:#b3daff; }
     .cmd-preview { background:#111317; border-radius:8px; padding:8px 10px; margin-top:6px; font-size:0.9em; color:#d8f4ff; max-height:140px; overflow-y:auto; white-space:pre-wrap; }
+    .info-icon-wrapper { display: inline-flex; align-items: center; gap: 6px; }
+    .info-icon { display: inline-block; width: 18px; height: 18px; border-radius: 50%; background: #0098FF; color: #fff; text-align: center; line-height: 18px; font-size: 12px; font-weight: bold; cursor: help; position: relative; flex-shrink: 0; }
+    .info-icon:hover { background: #00ddcb; }
+    .info-tooltip { visibility: hidden; opacity: 0; position: absolute; bottom: 125%; left: 50%; transform: translateX(-50%); background-color: #1a1d24; color: #eee; text-align: left; padding: 12px 14px; border-radius: 8px; border: 1px solid #444; box-shadow: 0 4px 12px rgba(0,0,0,0.6); z-index: 1000; width: 380px; font-size: 0.9em; font-weight: normal; line-height: 1.5; white-space: normal; transition: opacity 0.3s, visibility 0.3s; pointer-events: none; }
+    .info-icon:hover .info-tooltip { visibility: visible; opacity: 1; }
+    .info-tooltip::after { content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px; border-width: 5px; border-style: solid; border-color: #444 transparent transparent transparent; }
+    .info-tooltip strong { color: #86c6fe; display: block; margin-bottom: 4px; }
+    .info-tooltip ul { margin: 6px 0; padding-left: 20px; }
+    .info-tooltip li { margin: 4px 0; }
   </style>
 </head>
 <body>
@@ -201,7 +266,12 @@ HTML = '''
       <div class="section">
         <h3>1. Upload training images</h3>
         <label>Select images (multiple allowed)</label>
-        <input type="file" id="images" name="images" multiple accept="image/*" onchange="previewImages(event)">
+        <div class="file-input-wrapper">
+          <label for="images" class="file-input-label">Choose images</label>
+          <button type="button" class="file-input-clear-btn" id="clear-images-btn" onclick="clearSelectedImages()" style="display:none;">Clear all</button>
+          <span class="file-input-text" id="file-input-status">No files selected</span>
+          <input type="file" id="images" name="images" multiple accept="image/*" onchange="previewImages(event)">
+        </div>
         <div class="imglist imglist-empty" id="preview">
           <div class="drop-hint">
             Drag &amp; drop images here or use the file picker above.
@@ -238,12 +308,16 @@ HTML = '''
             <input name="trigger" type="text" value="{{trigger}}">
           </div>
           <div class="field-group field-group-half">
-            <label>VRAM profile (GPU memory)</label>
-            <select name="vram_profile" onchange="updateEstimate()">
-              <option value="12" {% if vram_profile == '12' %}selected{% endif %}>12 GB – safe / recommended (most offload, slowest)</option>
-              <option value="16" {% if vram_profile == '16' %}selected{% endif %}>16 GB – higher VRAM use (faster, may OOM)</option>
-              <option value="24" {% if vram_profile == '24' %}selected{% endif %}>24+ GB – performance (fastest)</option>
+            <label>Your GPU VRAM (select your graphics card's VRAM)</label>
+            <select name="vram_profile" onchange="updateEstimate(); syncAdvancedFlagsFromGui(false);">
+              <option value="12" {% if vram_profile == '12' %}selected{% endif %}>I have 12GB VRAM – uses ~12GB VRAM, offloads most to RAM (64GB+ RAM recommended, slowest but safest)</option>
+              <option value="16" {% if vram_profile == '16' %}selected{% endif %}>I have 16GB VRAM – uses ~16-18GB VRAM, offloads some to RAM (64GB+ RAM recommended, balanced)</option>
+              <option value="24" {% if vram_profile == '24' %}selected{% endif %}>I have 24GB+ VRAM – uses ~24GB VRAM, offloads minimal to RAM (64GB+ RAM recommended, fastest)</option>
             </select>
+            <small style="color: #888; display: block; margin-top: -12px; margin-bottom: 10px;">
+              Settings are automatically adjusted based on your GPU VRAM. The Qwen-Image model is ~38GB total, so model blocks are offloaded to RAM (64GB+ RAM recommended). 
+              <strong>16GB VRAM GPUs get optimized settings (~16-18GB VRAM usage) for better performance than 12GB GPUs.</strong>
+            </small>
           </div>
           <div class="field-group field-group-half">
             <label>Epochs (how many passes over the dataset)</label>
@@ -258,7 +332,26 @@ HTML = '''
             <input name="image_repeats" type="number" value="{{image_repeats}}" oninput="updateEstimate()">
           </div>
           <div class="field-group field-group-half">
-            <label>Learning rate</label>
+            <label class="info-icon-wrapper">
+              Learning rate
+              <span class="info-icon">
+                ?
+                <span class="info-tooltip">
+                  <strong>Learning Rate:</strong>
+                  Controls how quickly the model learns. Higher values = faster learning but may be unstable. Lower values = more stable but slower.
+                  <br><br>
+                  <strong>Common values:</strong>
+                  <ul>
+                    <li><strong>1e-4</strong> = 0.0001 (high, fast learning, may overfit)</li>
+                    <li><strong>5e-5</strong> = 0.00005 (default, balanced)</li>
+                    <li><strong>1e-5</strong> = 0.00001 (low, stable, slower)</li>
+                    <li><strong>5e-6</strong> = 0.000005 (very low, very stable, very slow)</li>
+                    <li><strong>1e-6</strong> = 0.000001 (extremely low, minimal changes)</li>
+                  </ul>
+                  <strong>Recommendation:</strong> Start with <strong>5e-5</strong> (0.00005). Use lower values (1e-5) for fine-tuning existing LoRAs or if you notice overfitting.
+                </span>
+              </span>
+            </label>
             <input name="lr" type="text" value="{{lr}}">
           </div>
           <div class="field-group field-group-half">
@@ -282,22 +375,58 @@ HTML = '''
             <input name="seed" type="number" value="{{seed}}">
           </div>
           <div class="field-group field-group-half">
-            <label>LoRA rank (lower = less VRAM)</label>
+            <label class="info-icon-wrapper">
+              LoRA rank (lower = less VRAM)
+              <span class="info-icon">
+                ?
+                <span class="info-tooltip">
+                  <strong>LoRA Rank (capacity):</strong>
+                  Controls how much detail the model can learn. Higher rank = more detail but more VRAM usage.
+                  <br><br>
+                  <strong>Recommendations:</strong>
+                  <ul>
+                    <li><strong>16:</strong> Low capacity, okay for simple styles</li>
+                    <li><strong>32:</strong> Good for people and faces</li>
+                    <li><strong>64:</strong> Very good for detailed faces</li>
+                    <li><strong>128:</strong> Maximum (may overfit with few images)</li>
+                  </ul>
+                  For training on a real person: use <strong>32-64</strong>.
+                </span>
+              </span>
+            </label>
             <input name="rank" type="number" value="{{rank}}">
           </div>
           <div class="field-group field-group-half">
-            <label>LoRA dims (lower = less VRAM)</label>
+            <label class="info-icon-wrapper">
+              LoRA dims (lower = less VRAM)
+              <span class="info-icon">
+                ?
+                <span class="info-tooltip">
+                  <strong>LoRA Dims (alpha):</strong>
+                  Controls the strength of the LoRA adaptation. Should be 1x-2x the rank value.
+                  <br><br>
+                  <strong>Recommendations:</strong>
+                  <ul>
+                    <li>If rank = 16 → dims = 16-32</li>
+                    <li>If rank = 32 → dims = 32-64</li>
+                    <li>If rank = 64 → dims = 64-128</li>
+                    <li>If rank = 128 → dims = 128-256</li>
+                  </ul>
+                  Default: dims = rank × 2 (e.g., rank 32 → dims 64)
+                </span>
+              </span>
+            </label>
             <input name="dims" type="number" value="{{dims}}">
           </div>
           <div class="field-group field-group-wide">
             <label>Output folder (under <code>output/</code>)</label>
-            <input name="output_dir" type="text" value="{{output_dir}}" placeholder="empty = use 'output'">
+            <input name="output_dir" type="text" value="{{user_output_dir}}" placeholder="empty = use 'output'" oninput="updateFinalPath()">
             <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 6px;">If you enter <code>art</code> files will be saved in <code>output/art/</code></small>
           </div>
           <div class="field-group field-group-wide">
             <label>LoRA filename (.safetensors)</label>
-            <input name="output_name" type="text" value="{{output_name}}" placeholder="lora" required>
-            <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 4px;">Final LoRA file: <code>output/{{output_dir}}/{{output_name}}.safetensors</code></small>
+            <input name="output_name" type="text" value="{{output_name}}" placeholder="lora" required oninput="updateFinalPath()">
+            <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 4px;">Final LoRA file: <code id="final-path-preview">output/{% if user_output_dir %}{{user_output_dir}}/{% endif %}{{output_name}}.safetensors</code></small>
           </div>
           <div class="field-group field-group-wide">
             <button type="button" id="advanced-toggle" onclick="toggleAdvancedFlags()">
@@ -443,8 +572,28 @@ HTML = '''
     function previewImages(event) {
         var preview = document.getElementById('preview');
         preview.innerHTML = '';
+        // Remove empty class when files are selected
+        preview.classList.remove('imglist-empty');
         var files = event.target && event.target.files ? event.target.files : (event.files || []);
         document.getElementById('uploaded_count').value = files.length;
+        
+        // Update file input status text and clear button visibility
+        const statusEl = document.getElementById('file-input-status');
+        const clearBtn = document.getElementById('clear-images-btn');
+        if (statusEl) {
+            if (files.length === 0) {
+                statusEl.textContent = "No files selected";
+                if (clearBtn) clearBtn.style.display = "none";
+                preview.classList.add('imglist-empty');
+                preview.innerHTML = '<div class="drop-hint">Drag &amp; drop images here or use the file picker above.</div>';
+            } else if (files.length === 1) {
+                statusEl.textContent = "1 file selected";
+                if (clearBtn) clearBtn.style.display = "inline-block";
+            } else {
+                statusEl.textContent = files.length + " files selected";
+                if (clearBtn) clearBtn.style.display = "inline-block";
+            }
+        }
         
         for (let i = 0; i < files.length; i++) {
             let f = files[i];
@@ -453,7 +602,9 @@ HTML = '''
             // Create container and caption in the correct order immediately
             var div = document.createElement('div');
             div.className = "imgbox";
-            div.innerHTML = '<img><br>' +
+            div.setAttribute('data-file-index', i);
+            div.innerHTML = '<button type="button" class="imgbox-remove" onclick="removeImage(' + i + ')" title="Remove this image">×</button>' +
+                '<img><br>' +
                 '<textarea class="caption-textarea" name="caption_' + i + '" rows="2" placeholder="Caption for image ' + (i + 1) + '"></textarea>';
             let imgEl = div.querySelector('img');
             preview.appendChild(div);
@@ -469,6 +620,60 @@ HTML = '''
         updateEstimate();
     }
 
+    function removeImage(indexToRemove) {
+        const fileInput = document.getElementById('images');
+        if (!fileInput || !fileInput.files || fileInput.files.length === 0) return;
+        
+        // Create a new FileList without the removed file
+        const dt = new DataTransfer();
+        const files = Array.from(fileInput.files);
+        
+        for (let i = 0; i < files.length; i++) {
+            if (i !== indexToRemove) {
+                dt.items.add(files[i]);
+            }
+        }
+        
+        // Update file input with new FileList
+        fileInput.files = dt.files;
+        
+        // Re-render preview with updated files
+        previewImages({ target: fileInput });
+    }
+
+    function clearSelectedImages() {
+        const fileInput = document.getElementById('images');
+        const preview = document.getElementById('preview');
+        const statusEl = document.getElementById('file-input-status');
+        const clearBtn = document.getElementById('clear-images-btn');
+        const uploadedCount = document.getElementById('uploaded_count');
+        
+        if (fileInput) {
+            // Clear the file input by creating a new one (old value can't be cleared directly)
+            fileInput.value = '';
+        }
+        
+        if (preview) {
+            preview.innerHTML = '<div class="drop-hint">Drag &amp; drop images here or use the file picker above.</div>';
+            preview.classList.remove('imglist-empty');
+            preview.classList.add('imglist-empty');
+        }
+        
+        if (statusEl) {
+            statusEl.textContent = "No files selected";
+        }
+        
+        if (clearBtn) {
+            clearBtn.style.display = "none";
+        }
+        
+        if (uploadedCount) {
+            uploadedCount.value = "0";
+        }
+        
+        updateEstimate();
+    }
+
     let autoCapTimer = null;
     let autoCapStart = null;
 
@@ -481,6 +686,28 @@ HTML = '''
       label.textContent = slider.value;
     }
 
+    function updateFinalPath() {
+      const outputDirInput = document.querySelector('input[name="output_dir"]');
+      const outputNameInput = document.querySelector('input[name="output_name"]');
+      const finalPathPreview = document.getElementById('final-path-preview');
+      
+      if (!outputDirInput || !outputNameInput || !finalPathPreview) return;
+      
+      const userOutputDir = (outputDirInput.value || "").trim();
+      const outputName = (outputNameInput.value || "lora").trim();
+      
+      // Build the path: output/subdir/lora.safetensors
+      // If userOutputDir is empty, just use "output/lora.safetensors"
+      let finalPath;
+      if (userOutputDir) {
+        finalPath = `output/${userOutputDir}/${outputName}.safetensors`;
+      } else {
+        finalPath = `output/${outputName}.safetensors`;
+      }
+      
+      finalPathPreview.textContent = finalPath;
+    }
+
     function toggleAdvancedFlags() {
       const panel = document.getElementById('advanced-flags-panel');
       const toggle = document.getElementById('advanced-toggle');
@@ -491,14 +718,20 @@ HTML = '''
     }
 
     function buildDefaultExtraFlags(vramProfile) {
+      // Map user's GPU VRAM to actual training settings
+      // 12GB VRAM GPU: Use blocks_to_swap 45 → ~12GB VRAM usage (safest, most offload to RAM)
       if (vramProfile === "12") {
         return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing --gradient_checkpointing_cpu_offload";
       }
+      // 16GB VRAM GPU: Use blocks_to_swap 30 → ~16-18GB VRAM usage (balanced, faster than 12GB profile)
+      // blocks_to_swap 16 would need 24GB VRAM which doesn't fit on 16GB cards
+      // blocks_to_swap 30 is a middle ground that should give ~16-18GB VRAM usage
       if (vramProfile === "16") {
-        return "--fp8_base --fp8_scaled --blocks_to_swap 16 --gradient_checkpointing";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 30 --gradient_checkpointing";
       }
+      // 24GB+ VRAM GPU: Can use blocks_to_swap 16 → ~24GB VRAM usage (fastest, minimal offload)
       if (vramProfile === "24") {
-        return "--gradient_checkpointing";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 16 --gradient_checkpointing";
       }
       return "";
     }
@@ -582,7 +815,12 @@ HTML = '''
         "--network_module", "networks.lora_qwen_image",
         "--optimizer_type", optimizer,
         "--mixed_precision", "bf16",
-        "--sdpa"
+        "--sdpa",
+        "--timestep_sampling", "shift",
+        "--weighting_scheme", "none",
+        "--discrete_flow_shift", "2.2",
+        "--max_data_loader_n_workers", "2",
+        "--persistent_data_loader_workers"
       ];
 
       if (advFlagsText.trim() !== "") {
@@ -889,6 +1127,7 @@ HTML = '''
       syncAdvancedFlagsFromGui(true);
       updateCommandPreview();
       updateCaptionLengthLabel();
+      updateFinalPath();
     });
   </script>
 </body>
@@ -1019,7 +1258,8 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
         "--text_encoder", text_encoder,
         "--batch_size", str(batch_size)
     ]
-    if int(str(vram_profile)) <= 12 or str(vram_profile) == "12":
+    # Use fp8_vl for text encoder when GPU has 16GB or less VRAM (recommended per documentation)
+    if str(vram_profile) in ["12", "16"]:
         cmd.append("--fp8_vl")
     if stream_output:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1240,8 +1480,13 @@ def gui():
     download_msg = ""
     uploaded_gallery = []
     trigger = "subjectword"
-    # Default profile tuned for ~12 GB VRAM GPUs (safer for many 16 GB cards)
+    # Default: Assume user has 12GB VRAM GPU (safest default)
+    # Settings are automatically adjusted based on user's selection:
+    # - 12GB VRAM GPU → blocks_to_swap 45 (~12GB VRAM usage, safest, most offload to RAM)
+    # - 16GB VRAM GPU → blocks_to_swap 30 (~16-18GB VRAM usage, balanced performance)
+    # - 24GB+ VRAM GPU → blocks_to_swap 16 (~24GB VRAM usage, fastest, minimal offload)
     vram_profile = "12"
+    user_output_dir = ""  # Just the subdirectory name, not the full path
     # Epochs do not affect memory usage, only total training time
     epochs = 6
     # Important for memory usage: batch size 1 is safest for 16 GB at 1024x1024
@@ -1324,6 +1569,13 @@ def gui():
                         rank = cfg.get("lora_rank", rank)
                         dims = cfg.get("lora_dims", dims)
                         output_dir = cfg.get("output_dir", output_dir)
+                        # Extract just the subdirectory name from full path for display
+                        if output_dir and output_dir.startswith("output/"):
+                            user_output_dir = output_dir.replace("output/", "", 1)
+                        elif output_dir == "output":
+                            user_output_dir = ""
+                        else:
+                            user_output_dir = output_dir
                         output_name = cfg.get("output_name", output_name)
                         advanced_flags = cfg.get("advanced_flags", advanced_flags)
                         # Optional: image_repeats, if present
@@ -1408,14 +1660,26 @@ def gui():
                         log_path = os.path.join(output_dir, log_filename)
                         ensure_dir(output_dir)
                         
-                        # 1. Cache latents
-                        output_queue.put("[Latent cache]\n")
+                        # Unload caption models to free VRAM before training
+                        output_queue.put("[Unloading caption models from VRAM...]\n")
                         with open(log_path, "w", encoding="utf-8") as log_file:
                             log_file.write(f"Training log started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                             log_file.write(f"Output directory: {output_dir}\n")
                             log_file.write(f"Output name: {output_name}\n")
                             log_file.write("="*60 + "\n\n")
-                            log_file.write("[Latent cache]\n")
+                            log_file.write("[Unloading caption models from VRAM...]\n")
+                            log_file.flush()
+                        unload_caption_models()
+                        output_queue.put("Caption models unloaded. Starting training process...\n")
+                        with open(log_path, "a", encoding="utf-8") as log_file:
+                            log_file.write("Caption models unloaded successfully.\n")
+                            log_file.flush()
+                        time.sleep(0.2)  # Small delay to allow VRAM to be freed
+                        
+                        # 1. Cache latents
+                        output_queue.put("[Latent cache]\n")
+                        with open(log_path, "a", encoding="utf-8") as log_file:
+                            log_file.write("\n[Latent cache]\n")
                             log_file.flush()
                             cache_latents_output = run_cache_latents(dataset_config, vae_model, stream_output=True, log_file=log_file)
                         output_queue.put("\n")
@@ -1449,8 +1713,18 @@ def gui():
                             "--network_module", "networks.lora_qwen_image",
                             "--optimizer_type", optimizer_type,
                             "--mixed_precision", "bf16",  # Recommended for Qwen-Image
-                            "--sdpa"  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
+                            "--sdpa",  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
+                            "--timestep_sampling", "shift",  # Recommended for Qwen-Image per documentation
+                            "--weighting_scheme", "none",  # Recommended for Qwen-Image per documentation
+                            "--discrete_flow_shift", "2.2",  # Recommended for Qwen-Image per documentation
+                            "--max_data_loader_n_workers", "2",  # Recommended for performance per documentation
+                            "--persistent_data_loader_workers"  # Recommended for performance per documentation
                         ] + extra_args
+                        
+                        # Add --fp8_vl for text encoder (recommended for <16GB VRAM per documentation)
+                        # Since we're using safe settings for 12GB and 16GB VRAM GPUs, add fp8_vl for both
+                        if str(vram_profile) in ["12", "16"]:
+                            cmd.append("--fp8_vl")
 
                         # Append any manually specified advanced flags from the GUI
                         manual_flags = []
@@ -1462,6 +1736,12 @@ def gui():
                                 manual_flags = str(advanced_flags).split()
                         if manual_flags:
                             cmd += manual_flags
+                        
+                        # Log the full command that will be executed (including all flags)
+                        full_cmd_str = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in cmd])
+                        output_queue.put(f"\n[Full training command]\n{full_cmd_str}\n")
+                        output_queue.put("="*60 + "\n\n")
+                        
                         env = dict(os.environ)
                         env["CUDA_VISIBLE_DEVICES"] = "0"
                         # Improve CUDA memory handling to reduce fragmentation (helps OOM)
@@ -1471,7 +1751,9 @@ def gui():
                             try:
                                 with open(log_path, "a", encoding="utf-8") as log_file:
                                     log_file.write("\n[Training]\n")
-                                    log_file.write(f"Command: {' '.join(cmd)}\n")
+                                    log_file.write(f"VRAM Profile: {vram_profile} GB\n")
+                                    log_file.write(f"Advanced flags: {advanced_flags}\n")
+                                    log_file.write(f"Full command:\n{full_cmd_str}\n")
                                     log_file.write("="*60 + "\n\n")
                                     log_file.flush()
                                     
@@ -1578,7 +1860,7 @@ def gui():
         downloads=DOWNLOADS, download_msg=download_msg,
         trigger=trigger, vram_profile=vram_profile, epochs=epochs, batch_size=batch_size, lr=lr,
         prompt=prompt, resolution=resolution, seed=seed, rank=rank, dims=dims,
-        output_dir=output_dir, output_name=output_name, image_repeats=image_repeats,
+        output_dir=output_dir, user_output_dir=user_output_dir, output_name=output_name, image_repeats=image_repeats,
         advanced_flags=advanced_flags,
         saved_yaml=saved_yaml, output_txt=output_txt,
         uploaded_gallery=uploaded_gallery

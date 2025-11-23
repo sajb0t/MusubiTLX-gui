@@ -1015,7 +1015,7 @@ HTML = r'''
         "--optimizer_type", optimizer,
         "--mixed_precision", "bf16",
         "--sdpa",
-        "--timestep_sampling", "sigma",
+        "--timestep_sampling", "qwen_shift",
         "--max_data_loader_n_workers", "2",
         "--persistent_data_loader_workers"
       ];
@@ -2096,7 +2096,7 @@ def gui():
                             "--optimizer_type", optimizer_type,
                             "--mixed_precision", "bf16",  # Recommended for Qwen-Image
                             "--sdpa",  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
-                            "--timestep_sampling", "sigma",  # Standard sampling method for better compatibility with different inference settings
+                            "--timestep_sampling", "qwen_shift",  # Recommended for Qwen-Image - optimizes timestep sampling for better results
                             "--max_data_loader_n_workers", "2",  # Recommended for performance per documentation
                             "--persistent_data_loader_workers"  # Recommended for performance per documentation
                         ] + extra_args

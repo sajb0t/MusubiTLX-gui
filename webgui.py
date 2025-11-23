@@ -20,6 +20,9 @@ caption_vit_feature_extractor = None
 caption_vit_tokenizer = None
 caption_blip_model = None
 caption_blip_processor = None
+caption_qwen_vl_model = None
+caption_qwen_vl_processor = None
+caption_qwen_vl_use_fp8 = False  # Track if we're using fp8 for Qwen-VL
 
 
 def _normalize_caption_text(text: str) -> str:
@@ -123,6 +126,72 @@ def load_blip_caption_model():
 
     return caption_blip_model, caption_blip_processor
 
+def load_qwen_vl_caption_model():
+    """
+    Lazy-load Qwen2.5-VL model for highly detailed captions.
+    Automatically finds the model in the project directory.
+    """
+    global caption_qwen_vl_model, caption_qwen_vl_processor
+    if caption_qwen_vl_model is not None and caption_qwen_vl_processor is not None:
+        return caption_qwen_vl_model, caption_qwen_vl_processor
+
+    _require_caption_deps()
+
+    import torch
+    from transformers import AutoProcessor
+    from musubi_tuner.qwen_image.qwen_image_utils import load_qwen2_5_vl
+    from PIL import Image
+
+    # Try to find the model automatically in common locations
+    possible_paths = [
+        os.environ.get("CAPTION_MODEL_PATH_QWEN_VL", ""),  # User override
+        "qwen_2.5_vl_7b.safetensors",  # Project root
+        os.path.join(os.path.dirname(__file__), "qwen_2.5_vl_7b.safetensors"),  # Same dir as webgui.py
+        os.path.join(os.getcwd(), "qwen_2.5_vl_7b.safetensors"),  # Current working directory
+    ]
+    
+    model_path = None
+    for path in possible_paths:
+        if path and os.path.exists(path) and os.path.isfile(path):
+            model_path = path
+            break
+    
+    if not model_path:
+        raise RuntimeError(
+            "Qwen-VL model not found.\n"
+            "Please ensure 'qwen_2.5_vl_7b.safetensors' is in the project directory, or set CAPTION_MODEL_PATH_QWEN_VL environment variable."
+        )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load processor (uses Hugging Face defaults)
+    IMAGE_FACTOR = 28
+    DEFAULT_MAX_SIZE = 1280
+    min_pixels = 256 * IMAGE_FACTOR * IMAGE_FACTOR
+    max_pixels = DEFAULT_MAX_SIZE * IMAGE_FACTOR * IMAGE_FACTOR
+    caption_qwen_vl_processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen2.5-VL-7B-Instruct", 
+        min_pixels=min_pixels, 
+        max_pixels=max_pixels
+    )
+    
+    # Load model - use fp8 to reduce VRAM usage (much lower memory footprint)
+    # fp8 reduces VRAM usage by ~50% compared to bfloat16
+    global caption_qwen_vl_use_fp8
+    try:
+        # Try fp8 first for lower VRAM usage (recommended if you have VRAM constraints)
+        dtype = torch.float8_e4m3fn
+        _, caption_qwen_vl_model = load_qwen2_5_vl(model_path, dtype=dtype, device=device, disable_mmap=True)
+        caption_qwen_vl_use_fp8 = True
+    except (RuntimeError, AttributeError, TypeError) as e:
+        # Fall back to bfloat16 if fp8 not available
+        dtype = torch.bfloat16
+        _, caption_qwen_vl_model = load_qwen2_5_vl(model_path, dtype=dtype, device=device, disable_mmap=True)
+        caption_qwen_vl_use_fp8 = False
+    caption_qwen_vl_model.eval()
+
+    return caption_qwen_vl_model, caption_qwen_vl_processor
+
 def unload_caption_models():
     """
     Unload caption models from memory to free VRAM before training.
@@ -130,6 +199,7 @@ def unload_caption_models():
     """
     global caption_vit_model, caption_vit_feature_extractor, caption_vit_tokenizer
     global caption_blip_model, caption_blip_processor
+    global caption_qwen_vl_model, caption_qwen_vl_processor
     
     try:
         import torch
@@ -165,6 +235,19 @@ def unload_caption_models():
     if caption_blip_processor is not None:
         caption_blip_processor = None
     
+    # Unload Qwen-VL model
+    if caption_qwen_vl_model is not None:
+        try:
+            if hasattr(caption_qwen_vl_model, 'to'):
+                caption_qwen_vl_model.to('cpu')
+            del caption_qwen_vl_model
+        except Exception:
+            pass
+        caption_qwen_vl_model = None
+    
+    if caption_qwen_vl_processor is not None:
+        caption_qwen_vl_processor = None
+    
     # Clear CUDA cache to free up VRAM
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -190,7 +273,7 @@ def download_with_progress(url, fname):
     urllib.request.urlretrieve(url, fname, reporthook)
     print("\nDownload finished")
 
-HTML = '''
+HTML = r'''
 <!DOCTYPE html>
 <html>
 <head>
@@ -278,7 +361,7 @@ HTML = '''
           </div>
         </div>
       <button type="button" id="autocap-btn" onclick="autoCaptionCaptionModel()">
-        Auto-caption images (ViT-GPT2 / BLIP)
+        Auto-caption images
       </button>
       <small style="color:#888; display:block; margin-top:4px;">
         First run will download and load the captioning model and can take a while. Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works (see the GUI README for the exact <code>pip install</code> command).
@@ -289,6 +372,7 @@ HTML = '''
       <select id="caption_model" name="caption_model">
         <option value="vit-gpt2" selected>ViT-GPT2 – fast, lightweight</option>
         <option value="blip-large">BLIP large – more detailed (slower, more VRAM)</option>
+        <option value="qwen-vl">Qwen-VL – extremely detailed (slowest, most VRAM)</option>
       </select>
       <label style="margin-top:8px;">
         Caption length
@@ -296,6 +380,16 @@ HTML = '''
       <input type="range" id="caption_max_length" name="caption_max_length" min="32" max="192" step="8" value="128" oninput="updateCaptionLengthLabel()">
       <div style="font-size:0.85em; color:#aaa; margin-top:2px;">
         Target length: <span id="caption_length_label">128</span> tokens (approximate, longer = more detail)
+      </div>
+      <label style="margin-top:12px;">
+        Detail level (BLIP only)
+      </label>
+      <input type="range" id="caption_detail_level" name="caption_detail_level" min="1" max="5" step="1" value="3" oninput="updateDetailLevelLabel()">
+      <div style="font-size:0.85em; color:#aaa; margin-top:2px;">
+        Level: <span id="detail_level_label">3</span> / 5 (<span id="detail_level_desc">Detailed</span>)
+      </div>
+      <div style="font-size:0.8em; color:#888; margin-top:4px; font-style:italic;">
+        Note: BLIP-large has inherent limitations and may not describe very fine details like specific lighting conditions or facial features in extreme detail, even at level 5.
       </div>
       <div id="autocap-status" class="status-box" style="display:none;"></div>
         <input type="hidden" name="uploaded_count" id="uploaded_count">
@@ -449,6 +543,18 @@ HTML = '''
         <div style="color:#aaa; font-size:0.9em; margin-bottom:6px; margin-top:4px;">
           <span id="time-estimate">Estimated training time: add images and adjust epochs/batch size.</span>
         </div>
+        <div id="few-images-warning" style="display:none; background: #332211; border-left: 4px solid #ffaa44; padding: 10px; margin-top: 10px; border-radius: 4px; color: #ffdd88;">
+          <strong>⚠️ Warning: Few training images detected</strong>
+          <br>
+          Training with very few images may not produce good results for person training. 
+          <strong>Recommendations:</strong>
+          <ul style="margin: 8px 0 0 20px; padding: 0;">
+            <li>Add more images (10-20 ideal for person training)</li>
+            <li>Increase epochs to 5-10 for more training steps</li>
+            <li>Use lower learning rate (1e-5) to reduce overfitting</li>
+            <li>Make captions more specific about the person's unique features</li>
+          </ul>
+        </div>
         <div class="button-row">
           <button type="button" id="start-btn" onclick="startTraining()">Start training</button>
           <button type="button" id="cancel-btn" onclick="cancelTraining()">Cancel training</button>
@@ -488,6 +594,20 @@ HTML = '''
         <pre>{{saved_yaml}}</pre>
       </div>
     {% endif %}
+    <div class="section" style="margin-top: 20px;">
+      <div id="system-resources" style="background: #1a1d24; border-radius: 8px; padding: 12px 16px; border: 1px solid #444;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px;">
+          <div style="flex: 1; min-width: 200px;">
+            <strong style="color: #86c6fe; font-size: 0.95em;">RAM:</strong>
+            <span id="ram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
+          </div>
+          <div style="flex: 1; min-width: 200px;">
+            <strong style="color: #86c6fe; font-size: 0.95em;">VRAM:</strong>
+            <span id="vram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
+          </div>
+        </div>
+      </div>
+    </div>
     <div id="output-container" style="display:none;">
       <div class="output">
         <strong>Training log:</strong><br>
@@ -500,6 +620,57 @@ HTML = '''
     </div>
   </div>
   <script>
+    // Update system resources (RAM/VRAM) display
+    async function updateSystemResources() {
+      try {
+        const response = await fetch('/system_resources');
+        const data = await response.json();
+        
+        const ramInfo = document.getElementById('ram-info');
+        const vramInfo = document.getElementById('vram-info');
+        
+        if (ramInfo && data.ram) {
+          if (data.ram.total_gb !== null) {
+            const available = data.ram.available_gb !== null ? data.ram.available_gb : 0;
+            const used = data.ram.used_gb !== null ? data.ram.used_gb : 0;
+            const total = data.ram.total_gb;
+            const percent = data.ram.percent !== null ? data.ram.percent : 0;
+            const color = percent > 90 ? '#ff6666' : percent > 75 ? '#ffaa44' : '#88ff88';
+            ramInfo.innerHTML = `<span style="color: ${color};">${available.toFixed(1)} GB free</span> / ${total.toFixed(1)} GB total (${percent.toFixed(1)}% used)`;
+          } else {
+            ramInfo.textContent = 'psutil not available';
+            ramInfo.style.color = '#888';
+          }
+        }
+        
+        if (vramInfo && data.vram) {
+          if (data.vram.total_gb !== null) {
+            const available = data.vram.available_gb !== null ? data.vram.available_gb : 0;
+            const used = data.vram.used_gb !== null ? data.vram.used_gb : 0;
+            const total = data.vram.total_gb;
+            const percent = data.vram.percent !== null ? data.vram.percent : 0;
+            const color = percent > 90 ? '#ff6666' : percent > 75 ? '#ffaa44' : '#88ff88';
+            vramInfo.innerHTML = `<span style="color: ${color};">${available.toFixed(1)} GB free</span> / ${total.toFixed(1)} GB total (${percent.toFixed(1)}% used)`;
+          } else {
+            vramInfo.textContent = 'NVIDIA GPU not detected';
+            vramInfo.style.color = '#888';
+          }
+        }
+      } catch (err) {
+        console.error('Failed to fetch system resources:', err);
+        const ramInfo = document.getElementById('ram-info');
+        const vramInfo = document.getElementById('vram-info');
+        if (ramInfo) {
+          ramInfo.textContent = 'Error loading';
+          ramInfo.style.color = '#ff6666';
+        }
+        if (vramInfo) {
+          vramInfo.textContent = 'Error loading';
+          vramInfo.style.color = '#ff6666';
+        }
+      }
+    }
+    
     function showSpinner() { 
       document.getElementById("spinner").style.display = "block";
       document.getElementById("output-container").style.display = "block";
@@ -522,6 +693,7 @@ HTML = '''
         const vramSelect = document.querySelector('select[name="vram_profile"]');
         const resInput = document.querySelector('input[name="resolution"]');
         const estElem = document.getElementById('time-estimate');
+        const warningElem = document.getElementById('few-images-warning');
         if (!epochsInput || !batchInput || !vramSelect || !resInput || !estElem) return;
         
         const epochs = parseInt(epochsInput.value || "0");
@@ -532,6 +704,7 @@ HTML = '''
         
         if (!uploaded || !epochs || !batchSize) {
             estElem.textContent = "Estimated training time: add images and set epochs/batch size.";
+            if (warningElem) warningElem.style.display = "none";
             return;
         }
         
@@ -539,9 +712,18 @@ HTML = '''
         let stepsPerEpoch = Math.ceil(effectiveImages / batchSize);
         let totalSteps = stepsPerEpoch * epochs;
         
+        // Show warning if too few images or too few steps for person training
+        if (warningElem) {
+            if (uploaded < 8 && totalSteps < 300) {
+                warningElem.style.display = "block";
+            } else {
+                warningElem.style.display = "none";
+            }
+        }
+        
         // Parse resolution to scale estimate by pixel count
         let w = 1024, h = 1024;
-        const m = resText.match(/(\\d+)\\s*x\\s*(\\d+)/i);
+        const m = resText.match(/(\d+)\s*x\s*(\d+)/i);
         if (m) {
             w = parseInt(m[1] || "1024");
             h = parseInt(m[2] || "1024");
@@ -684,6 +866,23 @@ HTML = '''
       const label = document.getElementById('caption_length_label');
       if (!slider || !label) return;
       label.textContent = slider.value;
+    }
+
+    function updateDetailLevelLabel() {
+      const slider = document.getElementById('caption_detail_level');
+      const label = document.getElementById('detail_level_label');
+      const desc = document.getElementById('detail_level_desc');
+      if (!slider || !label || !desc) return;
+      const level = parseInt(slider.value);
+      label.textContent = level;
+      const descriptions = {
+        1: 'Basic',
+        2: 'Standard',
+        3: 'Detailed',
+        4: 'Very Detailed',
+        5: 'Extremely Detailed'
+      };
+      desc.textContent = descriptions[level] || 'Standard';
     }
 
     function updateFinalPath() {
@@ -842,7 +1041,8 @@ HTML = '''
       const statusEl = document.getElementById('autocap-status');
       const modelSelect = document.getElementById('caption_model');
       const selectedModelValue = modelSelect ? (modelSelect.value || 'vit-gpt2') : 'vit-gpt2';
-      const runningModelName = selectedModelValue === 'blip-large' ? 'BLIP large' : 'ViT-GPT2';
+      const runningModelName = selectedModelValue === 'qwen-vl' ? 'Qwen-VL' : 
+                               selectedModelValue === 'blip-large' ? 'BLIP large' : 'ViT-GPT2';
       if (btn) {
         btn.disabled = true;
         btn.textContent = "Auto-captioning with " + runningModelName + "...";
@@ -877,6 +1077,10 @@ HTML = '''
         if (lengthSlider) {
           fd.append('caption_max_length', lengthSlider.value || '128');
         }
+        const detailLevelSlider = document.getElementById('caption_detail_level');
+        if (detailLevelSlider) {
+          fd.append('caption_detail_level', detailLevelSlider.value || '3');
+        }
 
         const resp = await fetch('/autocaption', {
           method: 'POST',
@@ -908,8 +1112,8 @@ HTML = '''
         }
 
         data.captions.forEach((cap, idx) => {
-          const field = document.querySelector('[name=\"caption_' + idx + '\"]');
-          if (field && (!field.value || field.value.trim() === \"\")) {
+          const field = document.querySelector('[name="caption_' + idx + '"]');
+          if (field && (!field.value || field.value.trim() === "")) {
             field.value = cap;
           }
         });
@@ -929,7 +1133,7 @@ HTML = '''
         autoCapStart = null;
         if (btn) {
           btn.disabled = false;
-          btn.textContent = "Auto-caption images (ViT-GPT2 / BLIP)";
+          btn.textContent = "Auto-caption images";
         }
       }
     }
@@ -1029,7 +1233,7 @@ HTML = '''
         }
         
         // Buffer SSE messages and flush to UI at most every SSE_FLUSH_INTERVAL_MS
-        const processedData = data + "\\n";
+        const processedData = data + "\n";
         sseBuffer += processedData;
         const now = Date.now();
         if (!lastSseFlush || (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || data.includes("TRAINING ABORTED WITH ERROR") || data.includes("✅ TRAINING COMPLETED!")) {
@@ -1061,11 +1265,11 @@ HTML = '''
       })
       .then(response => {
         if (!response.ok) {
-            document.getElementById("output-text").textContent += "❌ Server error when starting training: " + response.statusText + "\\n";
+            document.getElementById("output-text").textContent += "❌ Server error when starting training: " + response.statusText + "\n";
         }
       })
       .catch(error => {
-        document.getElementById("output-text").textContent += "❌ Network error when starting training: " + error + "\\n";
+            document.getElementById("output-text").textContent += "❌ Network error when starting training: " + error + "\n";
       });
     }
 
@@ -1099,23 +1303,23 @@ HTML = '''
         "seed","rank","dims","output_dir","output_name"
       ];
       names.forEach(n => {
-        const el = document.querySelector('input[name=\"' + n + '\"]');
+        const el = document.querySelector('input[name="' + n + '"]');
         if (el) {
           el.addEventListener('input', updateCommandPreview);
           el.addEventListener('change', updateCommandPreview);
         }
       });
-      const vramSel = document.querySelector('select[name=\"vram_profile\"]');
+      const vramSel = document.querySelector('select[name="vram_profile"]');
       if (vramSel) {
         vramSel.addEventListener('change', function() {
           syncAdvancedFlagsFromGui(false);
         });
       }
-      const optSel = document.querySelector('select[name=\"optimizer_type\"]');
+      const optSel = document.querySelector('select[name="optimizer_type"]');
       if (optSel) {
         optSel.addEventListener('change', updateCommandPreview);
       }
-      const advFlags = document.querySelector('textarea[name=\"advanced_flags\"]');
+      const advFlags = document.querySelector('textarea[name="advanced_flags"]');
       if (advFlags) {
         advFlags.addEventListener('input', function() {
           advFlagsDirty = true;
@@ -1125,7 +1329,12 @@ HTML = '''
       syncAdvancedFlagsFromGui(true);
       updateCommandPreview();
       updateCaptionLengthLabel();
+      updateDetailLevelLabel();
       updateFinalPath();
+      
+      // Update system resources when page loads and every 3 seconds
+      updateSystemResources();
+      setInterval(updateSystemResources, 3000);
     });
   </script>
 </body>
@@ -1339,11 +1548,28 @@ def autocaption():
     except ValueError:
         max_len = 0
     # Clamp to a safe range; fall back to sensible default if out of range
-    if max_len < 32 or max_len > 192:
-        max_len = 128
+    # Higher default for BLIP and Qwen-VL to allow more detailed captions
+    if max_len < 32 or max_len > 512:  # Increased max for Qwen-VL
+        if caption_model_choice == "qwen-vl":
+            max_len = 256  # Qwen-VL can handle longer captions
+        elif caption_model_choice == "blip-large":
+            max_len = 160
+        else:
+            max_len = 128
+    
+    # Optional detail level slider from GUI (1-5, only for BLIP)
+    detail_level_str = (request.form.get("caption_detail_level") or "").strip()
+    try:
+        detail_level = int(detail_level_str) if detail_level_str else 3
+        detail_level = max(1, min(5, detail_level))  # Clamp to 1-5
+    except ValueError:
+        detail_level = 3
 
     try:
-        if caption_model_choice == "blip-large":
+        if caption_model_choice == "qwen-vl":
+            model, processor = load_qwen_vl_caption_model()
+            model_type = "qwen-vl"
+        elif caption_model_choice == "blip-large":
             model, processor = load_blip_caption_model()
             model_type = "blip"
         else:
@@ -1387,19 +1613,95 @@ def autocaption():
             continue
 
         if model_type == "blip":
+            # BLIP unconditional captioning (no text parameter)
+            # Adjust parameters based on detail level (1-5)
+            # Level 1: Basic, Level 5: Extremely Detailed
             inputs = processor(images=image, return_tensors="pt").to(device)
+            
+            # Map detail level to generation parameters
+            # Note: BLIP-large has inherent limitations - it may not describe very fine details
+            # like specific lighting conditions or facial features in extreme detail
+            detail_params = {
+                1: {"num_beams": 6, "length_penalty": 1.1, "repetition_penalty": 1.1, "temperature": 0.8, "max_tokens_multiplier": 1.0},
+                2: {"num_beams": 8, "length_penalty": 1.2, "repetition_penalty": 1.2, "temperature": 0.75, "max_tokens_multiplier": 1.1},
+                3: {"num_beams": 10, "length_penalty": 1.5, "repetition_penalty": 1.3, "temperature": 0.7, "max_tokens_multiplier": 1.2},
+                4: {"num_beams": 15, "length_penalty": 1.8, "repetition_penalty": 1.4, "temperature": 0.6, "max_tokens_multiplier": 1.3},
+                5: {"num_beams": 20, "length_penalty": 2.5, "repetition_penalty": 1.6, "temperature": 0.5, "max_tokens_multiplier": 1.5},  # Extremely aggressive settings
+            }
+            params = detail_params.get(detail_level, detail_params[3])
+            
+            # Increase max tokens for higher detail levels to allow more detailed descriptions
+            effective_max_tokens = int(max_len * params["max_tokens_multiplier"])
+            effective_max_tokens = min(effective_max_tokens, 256)  # Cap at 256 to avoid memory issues
+            
             with torch.no_grad():
-                # Encourage longer, detailed but less repetitive captions for BLIP
+                # Generate caption with detail-level-adjusted parameters
+                # Higher detail levels use more aggressive parameters to extract maximum detail
                 output_ids = model.generate(
                     **inputs,
-                    max_new_tokens=max_len,
-                    num_beams=6,
-                    no_repeat_ngram_size=3,
-                    length_penalty=1.1,
-                    early_stopping=True,
+                    max_new_tokens=effective_max_tokens,
+                    num_beams=params["num_beams"],
+                    no_repeat_ngram_size=2 if detail_level >= 4 else 3,  # Less restrictive for level 4-5
+                    length_penalty=params["length_penalty"],
+                    repetition_penalty=params["repetition_penalty"],
+                    temperature=params["temperature"],
+                    early_stopping=False,  # Always allow full length for maximum detail
+                    do_sample=True if detail_level >= 4 else False,  # Enable sampling for highest levels
                 )
             caption_raw = processor.decode(output_ids[0], skip_special_tokens=True).strip()
             caption = _normalize_caption_text(caption_raw)
+        elif model_type == "qwen-vl":
+            # Qwen-VL uses prompt-based captioning for highly detailed descriptions
+            from musubi_tuner.caption_images_by_qwen_vl import DEFAULT_PROMPT, resize_image
+            DEFAULT_MAX_SIZE = 1280
+            IMAGE_FACTOR = 28
+            
+            # Use detailed prompt for comprehensive descriptions
+            detailed_prompt = DEFAULT_PROMPT
+            
+            # Prepare messages for Qwen-VL
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": detailed_prompt},
+                    ],
+                }
+            ]
+            
+            # Prepare inputs
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            image_inputs = resize_image(image, max_size=DEFAULT_MAX_SIZE)
+            inputs = processor(text=[text], images=image_inputs, padding=True, return_tensors="pt")
+            inputs = inputs.to(device)
+            
+            # Use autocast with appropriate dtype based on model dtype
+            model_dtype = next(caption_qwen_vl_model.parameters()).dtype
+            use_fp8 = model_dtype == torch.float8_e4m3fn
+            
+            if use_fp8:
+                # fp8 mode - use bfloat16 for autocast during generation
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    generated_ids = model.generate(
+                        **inputs, 
+                        max_new_tokens=max_len, 
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+            else:
+                # bfloat16 mode
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs, 
+                        max_new_tokens=max_len, 
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+            
+            # Extract only the generated part (remove input tokens)
+            generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+            caption_raw = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            caption = caption_raw[0] if caption_raw else ""
+            caption = _normalize_caption_text(caption)
         else:
             pixel_values = feature_extractor(images=[image], return_tensors="pt").pixel_values.to(device)
             with torch.no_grad():
@@ -1436,6 +1738,88 @@ def cancel_training():
 @app.route("/uploads/<filename>")
 def uploaded_image(filename):
     return send_file(os.path.join(app.config["UPLOAD_FOLDER"], filename))
+
+@app.route("/system_resources")
+def system_resources():
+    """Return current RAM and VRAM usage as JSON."""
+    try:
+        import psutil
+        ram = psutil.virtual_memory()
+        ram_total_gb = ram.total / (1024**3)
+        ram_used_gb = ram.used / (1024**3)
+        ram_available_gb = ram.available / (1024**3)
+        ram_percent = ram.percent
+    except ImportError:
+        ram_total_gb = ram_used_gb = ram_available_gb = ram_percent = None
+    
+    # Use nvidia-smi to get system-level VRAM usage (sees all processes, not just this one)
+    # Note: nvidia-smi comes automatically with NVIDIA drivers - no separate installation needed
+    # If not available, we fall back to PyTorch (only sees current process, not training subprocess)
+    vram_total_gb = None
+    vram_used_gb = None
+    vram_available_gb = None
+    vram_percent = None
+    
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total,memory.used,memory.free', '--format=csv,nounits,noheader'],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split(',')
+            if len(parts) >= 3:
+                vram_total_mb = float(parts[0].strip())
+                vram_used_mb = float(parts[1].strip())
+                vram_free_mb = float(parts[2].strip())
+                vram_total_gb = vram_total_mb / 1024
+                vram_used_gb = vram_used_mb / 1024
+                vram_available_gb = vram_free_mb / 1024
+                vram_percent = (vram_used_mb / vram_total_mb) * 100 if vram_total_mb > 0 else 0
+    except FileNotFoundError:
+        # nvidia-smi not found - user doesn't have NVIDIA GPU or NVIDIA drivers installed
+        # Fallback to PyTorch if available (only sees current process, not training subprocess)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                vram_used_gb = torch.cuda.memory_allocated(0) / (1024**3)
+                vram_reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
+                vram_available_gb = vram_total_gb - vram_reserved_gb
+                vram_percent = (vram_reserved_gb / vram_total_gb) * 100 if vram_total_gb > 0 else 0
+        except ImportError:
+            # PyTorch not available either - VRAM monitoring not possible
+            pass
+    except (subprocess.TimeoutExpired, Exception):
+        # nvidia-smi timed out or errored - try PyTorch as fallback
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                vram_used_gb = torch.cuda.memory_allocated(0) / (1024**3)
+                vram_reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
+                vram_available_gb = vram_total_gb - vram_reserved_gb
+                vram_percent = (vram_reserved_gb / vram_total_gb) * 100 if vram_total_gb > 0 else 0
+        except ImportError:
+            # PyTorch not available either - VRAM monitoring not possible
+            pass
+    
+    return jsonify({
+        "ram": {
+            "total_gb": round(ram_total_gb, 1) if ram_total_gb else None,
+            "used_gb": round(ram_used_gb, 1) if ram_used_gb else None,
+            "available_gb": round(ram_available_gb, 1) if ram_available_gb else None,
+            "percent": round(ram_percent, 1) if ram_percent is not None else None,
+        },
+        "vram": {
+            "total_gb": round(vram_total_gb, 1) if vram_total_gb else None,
+            "used_gb": round(vram_used_gb, 1) if vram_used_gb else None,
+            "available_gb": round(vram_available_gb, 1) if vram_available_gb else None,
+            "percent": round(vram_percent, 1) if vram_percent is not None else None,
+        }
+    })
 
 @app.route("/musubitlx_gui_readme")
 def musubitlx_gui_readme():

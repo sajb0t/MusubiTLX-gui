@@ -22,5 +22,5 @@ Simple web GUI for training Qwen-Image LoRA models using [Musubi Tuner](https://
 
 ![MusubiTLX GUI](gui.png)
 
-
+Result in ComfyUI with only trigger word as prompt
 ![MusubiTLX GUI](example.png)

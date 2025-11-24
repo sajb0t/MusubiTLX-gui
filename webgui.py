@@ -14,6 +14,7 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 OUTPUT_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "output"))
 current_log_path = None
+latest_readme_output_dir = None
 
 # Global queue for streaming output
 output_queue = queue.Queue()
@@ -352,6 +353,9 @@ HTML = r'''
     .info-tooltip strong { color: #86c6fe; display: block; margin-bottom: 4px; }
     .info-tooltip ul { margin: 6px 0; padding-left: 20px; }
     .info-tooltip li { margin: 4px 0; }
+    .unload-icon { display: inline-block; width: 16px; height: 16px; border-radius: 3px; background: transparent; color: #888; text-align: center; line-height: 16px; font-size: 13px; cursor: pointer; position: relative; flex-shrink: 0; margin-left: 6px; opacity: 0.6; transition: opacity 0.2s, color 0.2s; }
+    .unload-icon:hover { opacity: 1; color: #ff6b6b; background: rgba(255, 107, 107, 0.1); }
+    .unload-icon:disabled { opacity: 0.3; cursor: not-allowed; }
     .sample-section { background:#1b1f24; border:1px solid #32363f; border-radius:14px; padding:16px 18px; margin-top:18px; }
     .sample-toggle-row { display:flex; align-items:center; gap:12px; }
     .sample-toggle-row input[type="checkbox"] { width:auto; transform:scale(1.2); }
@@ -696,15 +700,34 @@ HTML = r'''
     <div class="section" style="margin-top: 20px;">
       <div id="system-resources" style="background: #1a1d24; border-radius: 8px; padding: 12px 16px; border: 1px solid #444;">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px;">
-          <div style="flex: 1; min-width: 200px;">
+          <div style="flex: 1; min-width: 200px; display: flex; align-items: center;">
             <strong style="color: #86c6fe; font-size: 0.95em;">RAM:</strong>
             <span id="ram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
+            <span class="unload-icon" id="force-unload-ram-icon" onclick="forceUnloadRAM()" title="Click to unload RAM">
+              🗑️
+              <span class="info-tooltip" style="width: 320px;">
+                <strong>Force Unload RAM</strong>
+                Aggressively unloads caption models, runs multiple garbage collection passes, clears PyTorch pinned memory, and attempts to clear system-level cached RAM (e.g., from ComfyUI or other processes).
+                <br><br>
+                <strong>Note:</strong> System cache clearing requires root permissions. If training is active, you'll be asked to confirm before unloading.
+              </span>
+            </span>
           </div>
-          <div style="flex: 1; min-width: 200px;">
+          <div style="flex: 1; min-width: 200px; display: flex; align-items: center;">
             <strong style="color: #86c6fe; font-size: 0.95em;">VRAM:</strong>
             <span id="vram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
+            <span class="unload-icon" id="force-unload-vram-icon" onclick="forceUnloadVRAM()" title="Click to unload VRAM">
+              🗑️
+              <span class="info-tooltip" style="width: 320px;">
+                <strong>Force Unload VRAM</strong>
+                Unloads caption models from GPU memory and clears CUDA cache to free up VRAM. This is useful if VRAM isn't freed after canceling training.
+                <br><br>
+                <strong>Note:</strong> If training is active, you'll be asked to confirm before unloading.
+              </span>
+            </span>
           </div>
         </div>
+        <small id="unload-status" style="color: #8ea2be; display: none; margin-top: 8px;"></small>
       </div>
     </div>
     <div id="output-container" style="display:none;">
@@ -717,6 +740,12 @@ HTML = r'''
           </div>
         </div>
         <pre id="output-text" style="max-height: 500px; overflow-y: auto; margin-top:10px;"></pre>
+        <div id="readme-link-container" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #444;">
+          <a id="readme-link" href="#" target="_blank" style="display:inline-block; padding:8px 16px; background:#7a5cff; color:#fff; text-decoration:none; border-radius:6px; font-weight:500;">
+            📄 View LoRA README.md
+          </a>
+          <small style="display:block; color:#888; margin-top:6px;">Ready to publish on CivitAI or other platforms</small>
+        </div>
       </div>
     </div>
     <div class="footer">
@@ -725,12 +754,137 @@ HTML = r'''
     </div>
   </div>
   <script>
+    // Make functions available globally immediately
+    window.toggleAdvancedFlags = function() {
+      const panel = document.getElementById('advanced-flags-panel');
+      const toggle = document.getElementById('advanced-toggle');
+      if (!panel || !toggle) return;
+      const visible = panel.style.display === "block";
+      panel.style.display = visible ? "none" : "block";
+      toggle.textContent = visible ? "Show advanced trainer flags" : "Hide advanced trainer flags";
+      if (!visible) {
+        if (typeof updateCommandPreview === 'function') {
+          updateCommandPreview();
+        }
+      }
+    };
+    
+    window.toggleSampleOptions = function() {
+      const checkbox = document.getElementById('samples_enabled');
+      const options = document.getElementById('sample-options');
+      if (!checkbox || !options) return;
+      options.style.display = checkbox.checked ? "block" : "none";
+    };
+    
+    // Force unload functions - make available globally
+    window.forceUnloadVRAM = async function() {
+      const spinner = document.getElementById("spinner");
+      if (spinner && spinner.style.display === "block") {
+        const confirmed = window.confirm("⚠️ Training is currently active!\n\nAre you sure you want to force unload VRAM? This may cause training to fail.\n\nClick OK to proceed anyway, or Cancel to abort.");
+        if (!confirmed) return;
+      }
+      const icon = document.getElementById("force-unload-vram-icon");
+      if (icon) {
+        icon.style.pointerEvents = "none";
+        icon.style.opacity = "0.3";
+      }
+      const statusEl = document.getElementById('unload-status');
+      if (statusEl) {
+        statusEl.style.display = "inline";
+        statusEl.style.color = "#8ea2be";
+        statusEl.textContent = "Unloading VRAM...";
+      }
+      try {
+        const resp = await fetch('/force_unload_vram', { method: 'POST' });
+        const data = await resp.json();
+        if (statusEl) {
+          if (data.status === "ok") {
+            statusEl.textContent = "✅ " + (data.message || "VRAM unloaded successfully");
+            statusEl.style.color = "#8ea2be";
+            if (typeof updateSystemResources === 'function') {
+              updateSystemResources();
+            }
+          } else {
+            statusEl.textContent = "❌ " + (data.message || "Failed to unload VRAM");
+            statusEl.style.color = "#ff8080";
+          }
+          setTimeout(() => {
+            if (statusEl) {
+              statusEl.style.display = "none";
+              statusEl.textContent = "";
+            }
+          }, 5000);
+        }
+      } catch (err) {
+        if (statusEl) {
+          statusEl.textContent = "❌ Error: " + err.message;
+          statusEl.style.color = "#ff8080";
+        }
+      } finally {
+        if (icon) {
+          icon.style.pointerEvents = "auto";
+          icon.style.opacity = "0.6";
+        }
+      }
+    };
+    
+    window.forceUnloadRAM = async function() {
+      const spinner = document.getElementById("spinner");
+      if (spinner && spinner.style.display === "block") {
+        const confirmed = window.confirm("⚠️ Training is currently active!\n\nAre you sure you want to force unload RAM? This may cause training to fail.\n\nClick OK to proceed anyway, or Cancel to abort.");
+        if (!confirmed) return;
+      }
+      const icon = document.getElementById("force-unload-ram-icon");
+      if (icon) {
+        icon.style.pointerEvents = "none";
+        icon.style.opacity = "0.3";
+      }
+      const statusEl = document.getElementById('unload-status');
+      if (statusEl) {
+        statusEl.style.display = "inline";
+        statusEl.style.color = "#8ea2be";
+        statusEl.textContent = "Unloading RAM...";
+      }
+      try {
+        const resp = await fetch('/force_unload_ram', { method: 'POST' });
+        const data = await resp.json();
+        if (statusEl) {
+          if (data.status === "ok") {
+            statusEl.textContent = "✅ " + (data.message || "RAM unloaded successfully");
+            statusEl.style.color = "#8ea2be";
+            if (typeof updateSystemResources === 'function') {
+              updateSystemResources();
+            }
+          } else {
+            statusEl.textContent = "❌ " + (data.message || "Failed to unload RAM");
+            statusEl.style.color = "#ff8080";
+          }
+          setTimeout(() => {
+            if (statusEl) {
+              statusEl.style.display = "none";
+              statusEl.textContent = "";
+            }
+          }, 5000);
+        }
+      } catch (err) {
+        if (statusEl) {
+          statusEl.textContent = "❌ Error: " + err.message;
+          statusEl.style.color = "#ff8080";
+        }
+      } finally {
+        if (icon) {
+          icon.style.pointerEvents = "auto";
+          icon.style.opacity = "0.6";
+        }
+      }
+    };
+    
     // Update system resources (RAM/VRAM) display
     async function updateSystemResources() {
       try {
         const response = await fetch('/system_resources');
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw new Error('HTTP ' + response.status);
         }
         const data = await response.json();
         
@@ -744,7 +898,7 @@ HTML = r'''
             const total = data.ram.total_gb;
             const percent = data.ram.percent !== null ? data.ram.percent : 0;
             const color = percent > 90 ? '#ff6666' : percent > 75 ? '#ffaa44' : '#88ff88';
-            ramInfo.innerHTML = `<span style="color: ${color};">${available.toFixed(1)} GB free</span> / ${total.toFixed(1)} GB total (${percent.toFixed(1)}% used)`;
+            ramInfo.innerHTML = '<span style="color: ' + color + ';">' + available.toFixed(1) + ' GB free</span> / ' + total.toFixed(1) + ' GB total (' + percent.toFixed(1) + '% used)';
           } else {
             ramInfo.textContent = 'psutil not available';
             ramInfo.style.color = '#888';
@@ -758,7 +912,7 @@ HTML = r'''
             const total = data.vram.total_gb;
             const percent = data.vram.percent !== null ? data.vram.percent : 0;
             const color = percent > 90 ? '#ff6666' : percent > 75 ? '#ffaa44' : '#88ff88';
-            vramInfo.innerHTML = `<span style="color: ${color};">${available.toFixed(1)} GB free</span> / ${total.toFixed(1)} GB total (${percent.toFixed(1)}% used)`;
+            vramInfo.innerHTML = '<span style="color: ' + color + ';">' + available.toFixed(1) + ' GB free</span> / ' + total.toFixed(1) + ' GB total (' + percent.toFixed(1) + '% used)';
           } else {
             vramInfo.textContent = 'NVIDIA GPU not detected';
             vramInfo.style.color = '#888';
@@ -803,7 +957,7 @@ HTML = r'''
       try {
         const resp = await fetch('/current_log');
         if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status}`);
+          throw new Error('HTTP ' + resp.status);
         }
         const data = await resp.json();
         if (typeof data.log_content === "string") {
@@ -811,6 +965,11 @@ HTML = r'''
           const outputText = document.getElementById("output-text");
           outputText.textContent = data.log_content;
           outputText.scrollTop = outputText.scrollHeight;
+          
+          // Show README link if training is finished and README exists
+          if (data.log_content.includes("✅ TRAINING COMPLETED!") || data.log_content.includes("LoRA README generated")) {
+            refreshReadmeLink();
+          }
         }
         if (showStatus) {
           if (data.training_active) {
@@ -824,7 +983,7 @@ HTML = r'''
         return data;
       } catch (err) {
         console.error('Failed to load log file:', err);
-        setLogStatus(`Failed to load log: ${err.message}`, true);
+        setLogStatus('Failed to load log: ' + err.message, true);
         return null;
       }
     }
@@ -837,18 +996,94 @@ HTML = r'''
       }
     }
     
+    function hideReadmeLink() {
+      const container = document.getElementById("readme-link-container");
+      if (container) {
+        container.style.display = "none";
+      }
+    }
+
+    async function refreshReadmeLink() {
+      const container = document.getElementById("readme-link-container");
+      const link = document.getElementById("readme-link");
+      if (!container || !link) return;
+      try {
+        const resp = await fetch('/latest_readme_link');
+        if (!resp.ok) {
+          throw new Error('HTTP ' + resp.status);
+        }
+        const data = await resp.json();
+        if (data.available && data.output_dir) {
+          link.href = '/lora_readme?output_dir=' + encodeURIComponent(data.output_dir);
+          container.style.display = "block";
+        } else {
+          container.style.display = "none";
+        }
+      } catch (err) {
+        console.error('Failed to refresh README link:', err);
+      }
+    }
+
     function showSpinner() { 
       document.getElementById("spinner").style.display = "block";
       document.getElementById("output-container").style.display = "block";
       document.getElementById("output-text").textContent = "";
+      hideReadmeLink();
       const startBtn = document.getElementById("start-btn");
       const cancelBtn = document.getElementById("cancel-btn");
       const saveYamlBtn = document.getElementById("saveyaml-btn");
       const loadYamlBtn = document.getElementById("loadyaml-btn");
+      const unloadVramIcon = document.getElementById("force-unload-vram-icon");
+      const unloadRamIcon = document.getElementById("force-unload-ram-icon");
       if (startBtn) startBtn.disabled = true;
       if (cancelBtn) cancelBtn.disabled = false;
       if (saveYamlBtn) saveYamlBtn.disabled = true;
       if (loadYamlBtn) loadYamlBtn.disabled = true;
+      if (unloadVramIcon) unloadVramIcon.style.pointerEvents = "none";
+      if (unloadRamIcon) unloadRamIcon.style.pointerEvents = "none";
+    }
+    
+    function enableAllButtons() {
+      const startBtn = document.getElementById("start-btn");
+      const cancelBtn = document.getElementById("cancel-btn");
+      const saveYamlBtn = document.getElementById("saveyaml-btn");
+      const loadYamlBtn = document.getElementById("loadyaml-btn");
+      const unloadVramIcon = document.getElementById("force-unload-vram-icon");
+      const unloadRamIcon = document.getElementById("force-unload-ram-icon");
+      if (startBtn) startBtn.disabled = false;
+      if (cancelBtn) cancelBtn.disabled = true;
+      if (saveYamlBtn) saveYamlBtn.disabled = false;
+      if (loadYamlBtn) loadYamlBtn.disabled = false;
+      if (unloadVramIcon) unloadVramIcon.style.pointerEvents = "auto";
+      if (unloadRamIcon) unloadRamIcon.style.pointerEvents = "auto";
+    }
+    
+    function setUnloadStatus(message, isError = false) {
+      const statusEl = document.getElementById('unload-status');
+      if (!statusEl) return;
+      if (!message) {
+        statusEl.style.display = "none";
+        statusEl.textContent = "";
+        return;
+      }
+      statusEl.style.display = "inline";
+      statusEl.style.color = isError ? "#ff8080" : "#8ea2be";
+      statusEl.textContent = message;
+      // Clear status after 5 seconds
+      setTimeout(() => setUnloadStatus(""), 5000);
+    }
+    
+    // Functions are already defined globally above
+    async function forceUnloadVRAM() {
+      if (window.forceUnloadVRAM) {
+        return window.forceUnloadVRAM();
+      }
+    }
+    
+    async function forceUnloadRAM() {
+      if (window.forceUnloadRAM) {
+        return window.forceUnloadRAM();
+      }
     }
     
     function updateEstimate() {
@@ -907,13 +1142,13 @@ HTML = r'''
         const totalSec = overheadSec + totalSteps * baseSec;
         let text;
         if (totalSec < 60) {
-            text = `Estimated training time: ~${totalSec.toFixed(0)} seconds (${totalSteps} steps).`;
+            text = 'Estimated training time: ~' + totalSec.toFixed(0) + ' seconds (' + totalSteps + ' steps).';
         } else if (totalSec < 3600) {
             const min = Math.round(totalSec / 60);
-            text = `Estimated training time: ~${min} minutes (${totalSteps} steps).`;
+            text = 'Estimated training time: ~' + min + ' minutes (' + totalSteps + ' steps).';
         } else {
             const hours = (totalSec / 3600).toFixed(1);
-            text = `Estimated training time: ~${hours} hours (${totalSteps} steps).`;
+            text = 'Estimated training time: ~' + hours + ' hours (' + totalSteps + ' steps).';
         }
         estElem.textContent = text;
     }
@@ -1060,13 +1295,13 @@ HTML = r'''
       if (!userOutputDir) {
         return baseOutput;
       }
-      return `${baseOutput}/${userOutputDir}`.replace(/\/+/g, "/");
+      return (baseOutput + '/' + userOutputDir).replace(/\/+/g, "/");
     }
 
     function markSampleGalleryPending(message) {
       const gallery = document.getElementById('sample-gallery');
       if (!gallery) return;
-      gallery.innerHTML = `<span>${message || "Output folder changed. Click refresh to load samples."}</span>`;
+      gallery.innerHTML = '<span>' + (message || "Output folder changed. Click refresh to load samples.") + '</span>';
       gallery.classList.add('sample-gallery-empty');
     }
 
@@ -1079,30 +1314,23 @@ HTML = r'''
       
       const outputName = (outputNameInput.value || "lora").trim();
       const finalOutDir = computeFinalOutputDir();
-      const finalPath = `${finalOutDir}/${outputName}.safetensors`.replace(/\/+/g, "/");
+      const finalPath = (finalOutDir + '/' + outputName + '.safetensors').replace(/\/+/g, "/");
       
       finalPathPreview.textContent = finalPath;
       markSampleGalleryPending("Output folder changed. Click refresh to load samples.");
     }
 
+    // Functions are already defined globally above, but keep these for backwards compatibility
     function toggleAdvancedFlags() {
-      const panel = document.getElementById('advanced-flags-panel');
-      const toggle = document.getElementById('advanced-toggle');
-      if (!panel || !toggle) return;
-      const visible = panel.style.display === "block";
-      panel.style.display = visible ? "none" : "block";
-      toggle.textContent = visible ? "Show advanced trainer flags" : "Hide advanced trainer flags";
-      // Update preview when panel is opened
-      if (!visible) {
-        updateCommandPreview();
+      if (window.toggleAdvancedFlags) {
+        window.toggleAdvancedFlags();
       }
     }
 
     function toggleSampleOptions() {
-      const checkbox = document.getElementById('samples_enabled');
-      const options = document.getElementById('sample-options');
-      if (!checkbox || !options) return;
-      options.style.display = checkbox.checked ? "block" : "none";
+      if (window.toggleSampleOptions) {
+        window.toggleSampleOptions();
+      }
     }
 
     function setSampleGalleryStatus(message, isError) {
@@ -1133,16 +1361,15 @@ HTML = r'''
         card.className = "sample-card";
         const media =
           file.kind === "video"
-            ? `<video src="${file.url}" muted loop playsinline></video>`
-            : `<img src="${file.url}" alt="${file.name} thumbnail">`;
+            ? '<video src="' + file.url + '" muted loop playsinline></video>'
+            : '<img src="' + file.url + '" alt="' + file.name + ' thumbnail">';
         const timestamp = file.mtime_display || "";
-        card.innerHTML = `
-          <a href="${file.url}" target="_blank" rel="noopener">
-            ${media}
-            <div class="sample-card-meta">${file.name}</div>
-            <div class="sample-card-meta" style="color:#888;">${timestamp}</div>
-          </a>
-        `;
+        card.innerHTML = 
+          '<a href="' + file.url + '" target="_blank" rel="noopener">' +
+            media +
+            '<div class="sample-card-meta">' + file.name + '</div>' +
+            '<div class="sample-card-meta" style="color:#888;">' + timestamp + '</div>' +
+          '</a>';
         gallery.appendChild(card);
       });
     }
@@ -1158,14 +1385,14 @@ HTML = r'''
       }
       setSampleGalleryStatus("Loading sample previews...", false);
       try {
-        const resp = await fetch(`/list_samples?output_dir=${encodeURIComponent(finalOutDir)}`);
+        const resp = await fetch('/list_samples?output_dir=' + encodeURIComponent(finalOutDir));
         if (!resp.ok) {
-          throw new Error(`Server responded with ${resp.status}`);
+          throw new Error('Server responded with ' + resp.status);
         }
         const data = await resp.json();
         renderSampleGallery(data.files || []);
         if (data.files && data.files.length) {
-          setSampleGalleryStatus(`Showing ${data.files.length} sample file${data.files.length > 1 ? "s" : ""}.`, false);
+          setSampleGalleryStatus('Showing ' + data.files.length + ' sample file' + (data.files.length > 1 ? 's' : '') + '.', false);
         } else if (auto) {
           setSampleGalleryStatus("No samples found yet for this run.", false);
         } else {
@@ -1173,7 +1400,7 @@ HTML = r'''
         }
       } catch (err) {
         console.error("Failed to load sample gallery:", err);
-        setSampleGalleryStatus(`Failed to load samples: ${err.message}`, true);
+        setSampleGalleryStatus('Failed to load samples: ' + err.message, true);
         renderSampleGallery([]);
       }
     }
@@ -1315,11 +1542,9 @@ HTML = r'''
         }
       }
 
-      const cmdString = cmdParts.map(p => (/\s/.test(p) ? `"${p}"` : p)).join(" ");
+      const cmdString = cmdParts.map(p => (/\s/.test(p) ? '"' + p + '"' : p)).join(" ");
       if (preview) {
         preview.textContent = cmdString;
-      } else {
-        console.warn('cmd-preview element not found');
       }
     }
 
@@ -1354,7 +1579,7 @@ HTML = r'''
           if (!autoCapStart) return;
           const elapsedSec = Math.round((Date.now() - autoCapStart) / 1000);
           statusEl.textContent = "Caption model is working"
-            + (elapsedSec > 0 ? ` (elapsed ~${elapsedSec}s). First run may take several minutes while the model downloads.` : "...");
+            + (elapsedSec > 0 ? ' (elapsed ~' + elapsedSec + 's). First run may take several minutes while the model downloads.' : "...");
         }, 2000);
       }
 
@@ -1414,7 +1639,7 @@ HTML = r'''
 
         if (statusEl) {
           const count = data.captions.length;
-          statusEl.textContent = `Auto-captioning finished successfully for ${count} image(s).`;
+          statusEl.textContent = 'Auto-captioning finished successfully for ' + count + ' image(s).';
         }
       } catch (err) {
         console.error(err);
@@ -1487,7 +1712,7 @@ HTML = r'''
         if (!finalOutDir) return;
         
         try {
-          const resp = await fetch(`/list_samples?output_dir=${encodeURIComponent(finalOutDir)}`);
+          const resp = await fetch('/list_samples?output_dir=' + encodeURIComponent(finalOutDir));
           if (!resp.ok) return;
           const data = await resp.json();
           const files = data.files || [];
@@ -1498,7 +1723,7 @@ HTML = r'''
             lastSampleFileCount = files.length;
             renderSampleGallery(files);
             // Update status briefly to show new samples were found
-            setSampleGalleryStatus(`${files.length} sample file${files.length > 1 ? "s" : ""} (${newCount} new)`, false);
+            setSampleGalleryStatus(files.length + ' sample file' + (files.length > 1 ? 's' : '') + ' (' + newCount + ' new)', false);
           }
         } catch (err) {
           // Silent fail - don't spam errors during polling
@@ -1533,14 +1758,7 @@ HTML = r'''
             eventSource.close();
             eventSource = null;
           }
-          const startBtn = document.getElementById("start-btn");
-          const cancelBtn = document.getElementById("cancel-btn");
-          const saveYamlBtn = document.getElementById("saveyaml-btn");
-          const loadYamlBtn = document.getElementById("loadyaml-btn");
-          if (startBtn) startBtn.disabled = false;
-          if (cancelBtn) cancelBtn.disabled = true;
-          if (saveYamlBtn) saveYamlBtn.disabled = false;
-          if (loadYamlBtn) loadYamlBtn.disabled = false;
+          enableAllButtons();
           const outputContainer = document.getElementById("output-container");
           outputContainer.style.border = "3px solid #ff5555";
           outputContainer.style.borderRadius = "10px";
@@ -1554,17 +1772,14 @@ HTML = r'''
             eventSource.close();
             eventSource = null;
           }
-          const startBtn = document.getElementById("start-btn");
-          const cancelBtn = document.getElementById("cancel-btn");
-          const saveYamlBtn = document.getElementById("saveyaml-btn");
-          const loadYamlBtn = document.getElementById("loadyaml-btn");
-          if (startBtn) startBtn.disabled = false;
-          if (cancelBtn) cancelBtn.disabled = true;
-          if (saveYamlBtn) saveYamlBtn.disabled = false;
-          if (loadYamlBtn) loadYamlBtn.disabled = false;
+          enableAllButtons();
           const outputContainer = document.getElementById("output-container");
           outputContainer.style.border = "3px solid #00ff00";
           outputContainer.style.borderRadius = "10px";
+          
+          // Show README link if available
+          refreshReadmeLink();
+          
           refreshSampleGallery(true);
           return;
         }
@@ -1572,9 +1787,15 @@ HTML = r'''
         const processedData = data + "\n";
         sseBuffer += processedData;
         const now = Date.now();
-        if (!lastSseFlush || (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || data.includes("TRAINING ABORTED WITH ERROR") || data.includes("✅ TRAINING COMPLETED!")) {
+        if (!lastSseFlush || (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || data.includes("TRAINING ABORTED WITH ERROR") || data.includes("✅ TRAINING COMPLETED!") || data.includes("LoRA README generated")) {
           outputText.textContent += sseBuffer;
           outputText.scrollTop = outputText.scrollHeight;
+          
+          // Check if README was generated and show link
+          if (sseBuffer.includes("LoRA README generated")) {
+            refreshReadmeLink();
+          }
+          
           sseBuffer = "";
           lastSseFlush = now;
         }
@@ -1708,6 +1929,11 @@ HTML = r'''
         } catch (err) {
           console.error('Failed to load sample gallery on page load:', err);
         }
+        try {
+          refreshReadmeLink();
+        } catch (err) {
+          console.error('Failed to refresh README link on load:', err);
+        }
       } catch (err) {
         console.error('Error during page initialization:', err);
       }
@@ -1757,6 +1983,113 @@ def save_uploaded_images(files, captions, output_dir, trigger_word=""):
             cf.write(full_caption)
         img_files.append(fname)
     return img_files
+
+def generate_lora_readme(output_dir, output_name, trigger, num_images, epochs, batch_size, image_repeats, 
+                          learning_rate, rank, dims, resolution, prompt, sample_prompt_text=None):
+    """
+    Generate a CivitAI-ready README.md file for the trained LoRA.
+    Format inspired by CivitAI's LoRA descriptions with bullet points and example prompts.
+    """
+    readme_path = os.path.join(output_dir, "LORA_README.md")
+    
+    # Calculate total steps
+    effective_images = num_images * image_repeats
+    steps_per_epoch = (effective_images + batch_size - 1) // batch_size
+    total_steps = steps_per_epoch * epochs
+    
+    # Generate title (use trigger word or output name)
+    title = trigger if trigger and trigger.strip() else output_name
+    title = title.replace("_", " ").title()
+    
+    # Generate description from prompt if available, otherwise create a default
+    description = ""
+    if prompt and prompt.strip():
+        description = prompt.strip()
+    else:
+        description = f"A LoRA trained for {title}."
+    
+    # Extract example prompts from sample_prompt_text
+    example_prompts = []
+    if sample_prompt_text:
+        lines = sample_prompt_text.strip().split("\n")
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                # Replace {{trigger}} with actual trigger word
+                prompt_line = line.replace("{{trigger}}", trigger if trigger else output_name)
+                # Remove parameter flags for example display (keep the prompt part)
+                # Extract just the prompt part (before --w, --h, etc.)
+                prompt_part = prompt_line.split("--")[0].strip()
+                if prompt_part:
+                    example_prompts.append(prompt_part)
+    
+    # Generate feature bullets based on training settings
+    features = []
+    if num_images >= 20:
+        features.append(f"Trained on {num_images}+ images for robust performance")
+    elif num_images >= 10:
+        features.append(f"Trained on {num_images} images")
+    else:
+        features.append(f"Trained on {num_images} images (consider adding more for better results)")
+    
+    if rank >= 32:
+        features.append("High-capacity LoRA (rank {}) for capturing fine details".format(rank))
+    else:
+        features.append("Efficient LoRA (rank {}) with balanced detail".format(rank))
+    
+    if resolution and "1024" in str(resolution):
+        features.append("Optimized for high-resolution generation ({} resolution)".format(resolution))
+    
+    features.append(f"Total training steps: {total_steps} steps over {epochs} epochs")
+    
+    # Generate README content in CivitAI-style format
+    readme_content = f"""# {title} LoRA
+
+{description}
+
+"""
+    
+    # Add features as bullet points (like CivitAI format)
+    if features:
+        readme_content += "## Features\n\n"
+        for feature in features:
+            readme_content += f"- {feature}\n"
+        readme_content += "\n"
+    
+    # Add example prompts if available
+    if example_prompts:
+        readme_content += "## Example Prompts\n\n"
+        for i, example in enumerate(example_prompts[:5], 1):  # Limit to 5 examples
+            readme_content += f"{i}. {example}\n\n"
+    
+    # Add usage instructions
+    readme_content += f"""## Usage
+
+Use the trigger word **`{trigger if trigger else output_name}`** in your prompts to activate this LoRA.
+
+## Training Details
+
+- **Base Model**: Qwen-Image
+- **Training Images**: {num_images} images
+- **Image Repeats**: {image_repeats}x per epoch
+- **Total Training Steps**: {total_steps} steps ({epochs} epochs × {steps_per_epoch} steps/epoch)
+- **Training Resolution**: {resolution}
+- **LoRA Rank**: {rank}
+- **LoRA Alpha**: {dims}
+- **Learning Rate**: {learning_rate}
+- **Batch Size**: {batch_size}
+- **Optimizer**: AdamW (with bfloat16 mixed precision)
+- **Training completed**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+This LoRA was trained using Musubi Tuner with MusubiTLX - A simple web GUI for training Qwen-Image LoRA models with Musubi Tuner.
+"""
+    
+    try:
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(readme_content)
+        return readme_path
+    except Exception as e:
+        return None
 
 def write_dataset_config_toml(folder, batch_size, resolution, num_repeats):
     toml_path = os.path.join(folder, "dataset_config.toml")
@@ -1808,8 +2141,18 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
                     output += line
                     sys.stdout.flush()
             proc.wait()
+            unregister_process(proc)  # Always unregister when process finishes
             # Check if process crashed or was killed
             if proc.returncode != 0:
+                # SIGTERM (-15) means the process was cancelled gracefully - don't raise exception
+                import signal
+                if proc.returncode == -signal.SIGTERM or proc.returncode == -15:
+                    # Process was cancelled by user - this is expected behavior
+                    output_queue.put("\n⚠️ Cache latents was cancelled\n")
+                    if log_file:
+                        log_file.write("\n⚠️ Cache latents was cancelled\n")
+                        log_file.flush()
+                    return ""  # Return empty output to indicate cancellation
                 error_msg = f"\n❌ Cache latents failed with exit code {proc.returncode}\n"
                 if proc.returncode < 0:
                     error_msg += f"Process was killed by signal {abs(proc.returncode)}\n"
@@ -1879,8 +2222,18 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
                     output += line
                     sys.stdout.flush()
             proc.wait()
+            unregister_process(proc)  # Always unregister when process finishes
             # Check if process crashed or was killed
             if proc.returncode != 0:
+                # SIGTERM (-15) means the process was cancelled gracefully - don't raise exception
+                import signal
+                if proc.returncode == -signal.SIGTERM or proc.returncode == -15:
+                    # Process was cancelled by user - this is expected behavior
+                    output_queue.put("\n⚠️ Cache text encoder was cancelled\n")
+                    if log_file:
+                        log_file.write("\n⚠️ Cache text encoder was cancelled\n")
+                        log_file.flush()
+                    return ""  # Return empty output to indicate cancellation
                 error_msg = f"\n❌ Cache text encoder failed with exit code {proc.returncode}\n"
                 if proc.returncode < 0:
                     error_msg += f"Process was killed by signal {abs(proc.returncode)}\n"
@@ -2119,14 +2472,110 @@ def autocaption():
 def cancel_training():
     """
     Request cancellation of any active training / caching subprocesses.
-    This is best-effort: we send terminate() to known child processes.
+    Also unloads models from VRAM/RAM to free memory.
     """
     cancel_active_processes()
+    
+    # Unload models to free VRAM/RAM after canceling
+    unload_caption_models()
+    import gc
+    gc.collect()
+    
     output_queue.put("\n" + "="*60 + "\n")
     output_queue.put("⏹ TRAINING CANCEL REQUEST RECEIVED. Attempting to stop processes...\n")
+    output_queue.put("Unloading models from VRAM/RAM...\n")
     output_queue.put("="*60 + "\n")
     output_queue.put("[TRAINING_FINISHED]\n")
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "message": "Training canceled. Models unloaded from memory."})
+
+@app.route("/force_unload_vram", methods=["POST"])
+def force_unload_vram():
+    """
+    Force unload all models from VRAM (caption models and clear CUDA cache).
+    """
+    try:
+        unload_caption_models()
+        import gc
+        gc.collect()
+        
+        # Additional aggressive CUDA cache clearing
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # Force garbage collection on CUDA tensors
+                gc.collect()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        
+        return jsonify({"status": "ok", "message": "VRAM unloaded. Caption models removed and CUDA cache cleared."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error unloading VRAM: {str(e)}"}), 500
+
+@app.route("/force_unload_ram", methods=["POST"])
+def force_unload_ram():
+    """
+    Force unload models from RAM by unloading caption models and running aggressive cleanup.
+    Attempts to free system-level cached RAM (e.g. from ComfyUI) by triggering OS cache cleanup.
+    """
+    try:
+        unload_caption_models()
+        import gc
+        import subprocess
+        import sys
+        
+        # Aggressive Python-level cleanup
+        # Run multiple GC passes to ensure cleanup
+        for _ in range(5):
+            gc.collect()
+        
+        # Try to free PyTorch pinned memory if available
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Clear CUDA pinned memory
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # Try to free memory allocated in pinned memory pools
+                if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                    torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        
+        # Additional aggressive GC after PyTorch cleanup
+        for _ in range(3):
+            gc.collect()
+        
+        # Try to trigger OS-level cache cleanup (Linux only, requires appropriate permissions)
+        # This can help free RAM cached by other processes like ComfyUI
+        cache_freed = False
+        try:
+            # Try to drop page cache, dentries, and inodes (requires root or appropriate capabilities)
+            # echo 3 > /proc/sys/vm/drop_caches clears page cache, dentries, and inodes
+            # This is safe but requires elevated permissions
+            result = subprocess.run(
+                ['sh', '-c', 'sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null'],
+                capture_output=True,
+                timeout=5,
+                check=False  # Don't fail if we can't do this
+            )
+            if result.returncode == 0:
+                cache_freed = True
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, Exception):
+            # If we can't drop caches (no permissions, not Linux, etc.), that's okay
+            pass
+        
+        message = "RAM unloaded. Caption models removed and aggressive garbage collection run."
+        if cache_freed:
+            message += " System cache cleared (may help free RAM from other processes like ComfyUI)."
+        else:
+            message += " System cache clear skipped (requires root permissions or not available on this system)."
+        
+        return jsonify({"status": "ok", "message": message})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error unloading RAM: {str(e)}"}), 500
 
 @app.route("/list_samples")
 def list_samples():
@@ -2195,6 +2644,38 @@ def sample_file():
         return "Not found", 404
     mime, _ = mimetypes.guess_type(abs_path)
     return send_file(abs_path, mimetype=mime or "application/octet-stream")
+
+@app.route("/lora_readme")
+def lora_readme():
+    """Serve the LORA_README.md file for a given output directory."""
+    output_dir = request.args.get("output_dir", "").strip()
+    if not output_dir:
+        return "Missing output_dir parameter", 400
+    try:
+        # Use resolve_output_path for security
+        readme_rel_path = os.path.join(output_dir, "LORA_README.md").replace("\\", "/")
+        abs_readme_path = resolve_output_path(readme_rel_path)
+        if not os.path.exists(abs_readme_path):
+            return "README file not found", 404
+        return send_file(abs_readme_path, mimetype="text/markdown")
+    except ValueError:
+        return "Invalid path", 400
+    except Exception as e:
+        return f"Error reading README: {str(e)}", 500
+
+
+@app.route("/latest_readme_link")
+def latest_readme_link():
+    """Return metadata for the most recently generated README (if available)."""
+    global latest_readme_output_dir
+    if latest_readme_output_dir:
+        readme_rel_path = os.path.join(latest_readme_output_dir, "LORA_README.md")
+        if os.path.exists(readme_rel_path):
+            return jsonify({
+                "available": True,
+                "output_dir": latest_readme_output_dir,
+            })
+    return jsonify({"available": False})
 
 @app.route("/current_log")
 def current_log():
@@ -2579,8 +3060,9 @@ def gui():
                         log_filename = f"training_log_{output_name}_{timestamp}.log"
                         log_path = os.path.join(output_dir, log_filename)
                         ensure_dir(output_dir)
-                        global current_log_path
+                        global current_log_path, latest_readme_output_dir
                         current_log_path = log_path
+                        latest_readme_output_dir = None
                         
                         # Unload caption models to free VRAM before training
                         output_queue.put("[Unloading caption models from VRAM...]\n")
@@ -2604,263 +3086,363 @@ def gui():
                             log_file.write("\n[Latent cache]\n")
                             log_file.flush()
                             cache_latents_output = run_cache_latents(dataset_config, vae_model, stream_output=True, log_file=log_file)
-                        output_queue.put("\n")
-                        time.sleep(0.1)  # Small delay to ensure output is sent
-                        
-                        # 2. Cache textencoder
-                        output_queue.put("[Text encoder cache]\n")
-                        with open(log_path, "a", encoding="utf-8") as log_file:
-                            log_file.write("\n[Text encoder cache]\n")
-                            log_file.flush()
-                            cache_textencoder_output = run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile, stream_output=True, log_file=log_file)
-                        output_queue.put("\n")
-                        time.sleep(0.1)  # Small delay to ensure output is sent
-                        
-                        # 3. Train LoRA
-                        output_queue.put("[Training]\n")
-                        cmd = [
-                            "python", "src/musubi_tuner/qwen_image_train_network.py",
-                            "--dit", dit_model,
-                            "--vae", vae_model,
-                            "--text_encoder", text_encoder,
-                            "--dataset_config", dataset_config,
-                            "--max_train_epochs", str(epochs),
-                            "--save_every_n_epochs", "1",
-                            "--learning_rate", lr,
-                            "--network_dim", str(rank),
-                            "--network_alpha", str(dims),
-                            "--seed", str(seed),
-                            "--output_dir", output_dir,
-                            "--output_name", output_name,
-                            "--network_module", "networks.lora_qwen_image",
-                            "--optimizer_type", optimizer_type,
-                            "--mixed_precision", "bf16",  # Recommended for Qwen-Image
-                            "--sdpa",  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
-                            "--timestep_sampling", "qwen_shift",  # Recommended for Qwen-Image - optimizes timestep sampling for better results
-                            "--max_data_loader_n_workers", "2",  # Recommended for performance per documentation
-                            "--persistent_data_loader_workers"  # Recommended for performance per documentation
-                        ] + extra_args
-                        
-                        # Add --fp8_vl for text encoder (recommended for <16GB VRAM per documentation)
-                        # Since we're using safe settings for 12GB and 16GB VRAM GPUs, add fp8_vl for both
-                        if str(vram_profile) in ["12", "16"]:
-                            cmd.append("--fp8_vl")
-
-                        # Add sample flags if samples are enabled
-                        if samples_enabled and sample_prompt_path and os.path.exists(sample_prompt_path):
-                            cmd.append("--sample_prompts")
-                            cmd.append(sample_prompt_path)
-                            if sample_every_epochs and int(sample_every_epochs) > 0:
-                                cmd.append("--sample_every_n_epochs")
-                                cmd.append(str(sample_every_epochs))
-                            if sample_every_steps and int(sample_every_steps) > 0:
-                                cmd.append("--sample_every_n_steps")
-                                cmd.append(str(sample_every_steps))
-                            if sample_at_first:
-                                cmd.append("--sample_at_first")
-                        
-                        # Append any manually specified advanced flags from the GUI
-                        manual_flags = []
-                        if advanced_flags:
-                            try:
-                                manual_flags = shlex.split(str(advanced_flags))
-                            except ValueError:
-                                # Fallback: simple whitespace split if user entered something odd
-                                manual_flags = str(advanced_flags).split()
-                        if manual_flags:
-                            cmd += manual_flags
-                        
-                        # Log the full command that will be executed (including all flags)
-                        full_cmd_str = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in cmd])
-                        output_queue.put(f"\n[Full training command]\n{full_cmd_str}\n")
-                        output_queue.put("="*60 + "\n\n")
-                        
-                        env = dict(os.environ)
-                        env["CUDA_VISIBLE_DEVICES"] = "0"
-                        # Improve CUDA memory handling to reduce fragmentation (helps OOM)
-                        # Use PYTORCH_ALLOC_CONF instead of deprecated PYTORCH_CUDA_ALLOC_CONF
-                        if "PYTORCH_CUDA_ALLOC_CONF" in env:
-                            # Migrate old setting to new format
-                            old_value = env.pop("PYTORCH_CUDA_ALLOC_CONF")
-                            env.setdefault("PYTORCH_ALLOC_CONF", old_value)
+                        # Check if cache was cancelled - if so, abort training
+                        if cache_latents_output == "":
+                            output_queue.put("\n❌ Training cancelled: Cache latents was interrupted\n")
+                            output_queue.put("[TRAINING_FINISHED]\n")
                         else:
-                            env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-                        
-                        def run_training():
-                            try:
-                                with open(log_path, "a", encoding="utf-8") as log_file:
-                                    log_file.write("\n[Training]\n")
-                                    log_file.write(f"VRAM Profile: {vram_profile} GB\n")
-                                    log_file.write(f"Advanced flags: {advanced_flags}\n")
-                                    log_file.write(f"Full command:\n{full_cmd_str}\n")
-                                    log_file.write("="*60 + "\n\n")
-                                    log_file.flush()
-                                    
-                                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                           text=True, env=env, bufsize=0, universal_newlines=True)
-                                    register_process(proc)
-                                    import sys
-                                    
-                                    # RAM monitoring: check every 10 seconds
-                                    last_ram_check_time = time.time()
-                                    RAM_CHECK_INTERVAL = 10.0  # seconds
-                                    RAM_THRESHOLD_PERCENT = 95.0
-                                    ram_aborted = False
-                                    
+                            output_queue.put("\n")
+                            time.sleep(0.1)  # Small delay to ensure output is sent
+                            
+                            # 2. Cache textencoder
+                            output_queue.put("[Text encoder cache]\n")
+                            with open(log_path, "a", encoding="utf-8") as log_file:
+                                log_file.write("\n[Text encoder cache]\n")
+                                log_file.flush()
+                                cache_textencoder_output = run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile, stream_output=True, log_file=log_file)
+                            # Check if cache was cancelled - if so, abort training
+                            if cache_textencoder_output == "":
+                                output_queue.put("\n❌ Training cancelled: Cache text encoder was interrupted\n")
+                                output_queue.put("[TRAINING_FINISHED]\n")
+                            else:
+                                output_queue.put("\n")
+                                time.sleep(0.1)  # Small delay to ensure output is sent
+                                
+                                # 3. Train LoRA
+                                output_queue.put("[Training]\n")
+                                cmd = [
+                                    "python", "src/musubi_tuner/qwen_image_train_network.py",
+                                    "--dit", dit_model,
+                                    "--vae", vae_model,
+                                    "--text_encoder", text_encoder,
+                                    "--dataset_config", dataset_config,
+                                    "--max_train_epochs", str(epochs),
+                                    "--save_every_n_epochs", "1",
+                                    "--learning_rate", lr,
+                                    "--network_dim", str(rank),
+                                    "--network_alpha", str(dims),
+                                    "--seed", str(seed),
+                                    "--output_dir", output_dir,
+                                    "--output_name", output_name,
+                                    "--network_module", "networks.lora_qwen_image",
+                                    "--optimizer_type", optimizer_type,
+                                    "--mixed_precision", "bf16",  # Recommended for Qwen-Image
+                                    "--sdpa",  # Use PyTorch's scaled dot product attention (requires PyTorch 2.0)
+                                    "--timestep_sampling", "qwen_shift",  # Recommended for Qwen-Image - optimizes timestep sampling for better results
+                                    "--max_data_loader_n_workers", "2",  # Recommended for performance per documentation
+                                    "--persistent_data_loader_workers"  # Recommended for performance per documentation
+                                ] + extra_args
+                                
+                                # Add --fp8_vl for text encoder (recommended for <16GB VRAM per documentation)
+                                # Since we're using safe settings for 12GB and 16GB VRAM GPUs, add fp8_vl for both
+                                if str(vram_profile) in ["12", "16"]:
+                                    cmd.append("--fp8_vl")
+
+                                # Add sample flags if samples are enabled
+                                if samples_enabled and sample_prompt_path and os.path.exists(sample_prompt_path):
+                                    cmd.append("--sample_prompts")
+                                    cmd.append(sample_prompt_path)
+                                    if sample_every_epochs and int(sample_every_epochs) > 0:
+                                        cmd.append("--sample_every_n_epochs")
+                                        cmd.append(str(sample_every_epochs))
+                                    if sample_every_steps and int(sample_every_steps) > 0:
+                                        cmd.append("--sample_every_n_steps")
+                                        cmd.append(str(sample_every_steps))
+                                    if sample_at_first:
+                                        cmd.append("--sample_at_first")
+                                
+                                # Append any manually specified advanced flags from the GUI
+                                manual_flags = []
+                                if advanced_flags:
                                     try:
-                                        for line in iter(proc.stdout.readline, ''):
-                                            # Check RAM usage every RAM_CHECK_INTERVAL seconds
-                                            current_time = time.time()
-                                            if current_time - last_ram_check_time >= RAM_CHECK_INTERVAL:
-                                                last_ram_check_time = current_time
-                                                ram_percent = get_ram_percent()
-                                                if ram_percent is not None and ram_percent > RAM_THRESHOLD_PERCENT:
-                                                    # RAM exceeded threshold - abort training
-                                                    ram_aborted = True
-                                                    error_msg = f"\n" + "="*60 + "\n"
-                                                    error_msg += f"⚠️  CRITICAL: RAM usage is {ram_percent:.1f}% (threshold: {RAM_THRESHOLD_PERCENT}%)\n"
-                                                    error_msg += f"Training aborted to prevent system lockup.\n"
-                                                    error_msg += f"Unloading caption models to free memory...\n"
-                                                    error_msg += "="*60 + "\n"
+                                        manual_flags = shlex.split(str(advanced_flags))
+                                    except ValueError:
+                                        # Fallback: simple whitespace split if user entered something odd
+                                        manual_flags = str(advanced_flags).split()
+                                if manual_flags:
+                                    cmd += manual_flags
+                                
+                                # Log the full command that will be executed (including all flags)
+                                full_cmd_str = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in cmd])
+                                output_queue.put(f"\n[Full training command]\n{full_cmd_str}\n")
+                                output_queue.put("="*60 + "\n\n")
+                                
+                                env = dict(os.environ)
+                                env["CUDA_VISIBLE_DEVICES"] = "0"
+                                # Improve CUDA memory handling to reduce fragmentation (helps OOM)
+                                # Use PYTORCH_ALLOC_CONF instead of deprecated PYTORCH_CUDA_ALLOC_CONF
+                                if "PYTORCH_CUDA_ALLOC_CONF" in env:
+                                    # Migrate old setting to new format
+                                    old_value = env.pop("PYTORCH_CUDA_ALLOC_CONF")
+                                    env.setdefault("PYTORCH_ALLOC_CONF", old_value)
+                                else:
+                                    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+                                
+                                def run_training():
+                                    global latest_readme_output_dir
+                                    try:
+                                        with open(log_path, "a", encoding="utf-8") as log_file:
+                                            log_file.write("\n[Training]\n")
+                                            log_file.write(f"VRAM Profile: {vram_profile} GB\n")
+                                            log_file.write(f"Advanced flags: {advanced_flags}\n")
+                                            log_file.write(f"Full command:\n{full_cmd_str}\n")
+                                            log_file.write("="*60 + "\n\n")
+                                            log_file.flush()
+                                            
+                                            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                                   text=True, env=env, bufsize=0, universal_newlines=True)
+                                            register_process(proc)
+                                            import sys
+                                            
+                                            # RAM monitoring: check every 10 seconds
+                                            last_ram_check_time = time.time()
+                                            RAM_CHECK_INTERVAL = 10.0  # seconds
+                                            RAM_THRESHOLD_PERCENT = 95.0
+                                            ram_aborted = False
+                                            
+                                            try:
+                                                for line in iter(proc.stdout.readline, ''):
+                                                    # Check RAM usage every RAM_CHECK_INTERVAL seconds
+                                                    current_time = time.time()
+                                                    if current_time - last_ram_check_time >= RAM_CHECK_INTERVAL:
+                                                        last_ram_check_time = current_time
+                                                        ram_percent = get_ram_percent()
+                                                        if ram_percent is not None and ram_percent > RAM_THRESHOLD_PERCENT:
+                                                            # RAM exceeded threshold - abort training
+                                                            ram_aborted = True
+                                                            error_msg = f"\n" + "="*60 + "\n"
+                                                            error_msg += f"⚠️  CRITICAL: RAM usage is {ram_percent:.1f}% (threshold: {RAM_THRESHOLD_PERCENT}%)\n"
+                                                            error_msg += f"Training aborted to prevent system lockup.\n"
+                                                            error_msg += f"Unloading caption models to free memory...\n"
+                                                            error_msg += "="*60 + "\n"
+                                                            output_queue.put(error_msg)
+                                                            log_file.write(error_msg)
+                                                            log_file.flush()
+                                                            
+                                                            # Unload caption models to free RAM
+                                                            try:
+                                                                unload_caption_models()
+                                                                unload_msg = "Caption models unloaded.\n"
+                                                                output_queue.put(unload_msg)
+                                                                log_file.write(unload_msg)
+                                                                log_file.flush()
+                                                            except Exception as unload_err:
+                                                                unload_err_msg = f"Warning: Error unloading models: {str(unload_err)}\n"
+                                                                output_queue.put(unload_err_msg)
+                                                                log_file.write(unload_err_msg)
+                                                                log_file.flush()
+                                                            
+                                                            # Terminate training process
+                                                            if proc.poll() is None:
+                                                                proc.terminate()
+                                                                # Wait up to 5 seconds for graceful termination
+                                                                try:
+                                                                    proc.wait(timeout=5)
+                                                                except subprocess.TimeoutExpired:
+                                                                    # Force kill if it doesn't terminate gracefully
+                                                                    proc.kill()
+                                                                    proc.wait()
+                                                            
+                                                            # Mark return code to indicate RAM abort (process is already terminated)
+                                                            proc.returncode = -99
+                                                            break  # Exit the loop
+                                                    
+                                                    if line:
+                                                        # Normalize progress output: replace carriage return with newline
+                                                        line = line.replace('\r\n', '\n').replace('\r', '\n')
+                                                        # Send to queue immediately
+                                                        output_queue.put(line)
+                                                        # Write to log file
+                                                        log_file.write(line)
+                                                        log_file.flush()
+                                                        # Force flush stdout if possible
+                                                        sys.stdout.flush()
+                                                
+                                                # Only wait if process wasn't aborted by RAM monitoring
+                                                if not ram_aborted:
+                                                    proc.wait()
+                                                
+                                                # If RAM aborted, skip normal error handling (already handled above)
+                                                if ram_aborted:
+                                                    output_queue.put("\n" + "="*60 + "\n")
+                                                    output_queue.put("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
+                                                    output_queue.put("="*60 + "\n")
+                                                    output_queue.put("All caption models have been unloaded from memory.\n")
+                                                    log_file.write("\n" + "="*60 + "\n")
+                                                    log_file.write("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
+                                                    log_file.write("="*60 + "\n")
+                                                    log_file.write("All caption models have been unloaded from memory.\n")
+                                                    log_file.flush()
+                                                # Check if process crashed (only if not RAM aborted)
+                                                elif proc.returncode != 0:
+                                                    error_msg = f"\n❌ Process exited with code {proc.returncode}\n"
                                                     output_queue.put(error_msg)
                                                     log_file.write(error_msg)
                                                     log_file.flush()
-                                                    
-                                                    # Unload caption models to free RAM
-                                                    try:
-                                                        unload_caption_models()
-                                                        unload_msg = "Caption models unloaded.\n"
-                                                        output_queue.put(unload_msg)
-                                                        log_file.write(unload_msg)
-                                                        log_file.flush()
-                                                    except Exception as unload_err:
-                                                        unload_err_msg = f"Warning: Error unloading models: {str(unload_err)}\n"
-                                                        output_queue.put(unload_err_msg)
-                                                        log_file.write(unload_err_msg)
-                                                        log_file.flush()
-                                                    
-                                                    # Terminate training process
-                                                    if proc.poll() is None:
-                                                        proc.terminate()
-                                                        # Wait up to 5 seconds for graceful termination
-                                                        try:
-                                                            proc.wait(timeout=5)
-                                                        except subprocess.TimeoutExpired:
-                                                            # Force kill if it doesn't terminate gracefully
-                                                            proc.kill()
-                                                            proc.wait()
-                                                    
-                                                    # Mark return code to indicate RAM abort (process is already terminated)
-                                                    proc.returncode = -99
-                                                    break  # Exit the loop
-                                            
-                                            if line:
-                                                # Normalize progress output: replace carriage return with newline
-                                                line = line.replace('\r\n', '\n').replace('\r', '\n')
-                                                # Send to queue immediately
-                                                output_queue.put(line)
-                                                # Write to log file
-                                                log_file.write(line)
+                                            except Exception as e:
+                                                error_msg = f"\n❌ ERROR DURING TRAINING: {str(e)}\n"
+                                                output_queue.put(error_msg)
+                                                log_file.write(error_msg)
+                                                import traceback
+                                                log_file.write(traceback.format_exc())
                                                 log_file.flush()
-                                                # Force flush stdout if possible
-                                                sys.stdout.flush()
-                                        
-                                        # Only wait if process wasn't aborted by RAM monitoring
-                                        if not ram_aborted:
-                                            proc.wait()
-                                        
-                                        # If RAM aborted, skip normal error handling (already handled above)
-                                        if ram_aborted:
-                                            output_queue.put("\n" + "="*60 + "\n")
-                                            output_queue.put("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
-                                            output_queue.put("="*60 + "\n")
-                                            output_queue.put("All caption models have been unloaded from memory.\n")
-                                            log_file.write("\n" + "="*60 + "\n")
-                                            log_file.write("❌ TRAINING ABORTED: RAM usage exceeded 95%\n")
-                                            log_file.write("="*60 + "\n")
-                                            log_file.write("All caption models have been unloaded from memory.\n")
+                                                if proc.poll() is None:
+                                                    proc.terminate()
+                                                    proc.wait()
+                                                raise
+                                            
+                                            # Skip success message if RAM aborted
+                                            if ram_aborted:
+                                                # Already logged above, just mark as finished
+                                                pass
+                                            elif proc.returncode == 0:
+                                                output_queue.put("\n" + "="*60 + "\n")
+                                                output_queue.put("✅ TRAINING COMPLETED!\n")
+                                                output_queue.put("="*60 + "\n")
+                                                final_path = os.path.join(output_dir, output_name + ".safetensors")
+                                                epoch_path = os.path.join(output_dir, output_name + "-000001.safetensors")
+                                                output_queue.put(f"LoRA file has been saved to: {final_path}\n")
+                                                if os.path.exists(epoch_path):
+                                                    output_queue.put(f"And epoch files such as: {epoch_path}\n")
+                                                output_queue.put(f"Absolute path: {os.path.abspath(final_path)}\n")
+                                                output_queue.put(f"Log file: {log_path}\n")
+                                                
+                                                # Generate LORA_README.md
+                                                readme_path = None
+                                                try:
+                                                    # Ensure all required variables have default values
+                                                    # Access variables from outer scope and provide defaults
+                                                    try:
+                                                        trigger_val = trigger or output_name
+                                                    except NameError:
+                                                        trigger_val = output_name
+                                                    try:
+                                                        epochs_val = int(epochs) if epochs else 6
+                                                    except (NameError, TypeError, ValueError):
+                                                        epochs_val = 6
+                                                    try:
+                                                        batch_size_val = int(batch_size) if batch_size else 1
+                                                    except (NameError, TypeError, ValueError):
+                                                        batch_size_val = 1
+                                                    try:
+                                                        image_repeats_val = int(image_repeats) if image_repeats else 1
+                                                    except (NameError, TypeError, ValueError):
+                                                        image_repeats_val = 1
+                                                    try:
+                                                        lr_val = lr or "5e-5"
+                                                    except NameError:
+                                                        lr_val = "5e-5"
+                                                    try:
+                                                        rank_val = int(rank) if rank else 16
+                                                    except (NameError, TypeError, ValueError):
+                                                        rank_val = 16
+                                                    try:
+                                                        dims_val = int(dims) if dims else 128
+                                                    except (NameError, TypeError, ValueError):
+                                                        dims_val = 128
+                                                    try:
+                                                        resolution_val = resolution or "1024x1024"
+                                                    except NameError:
+                                                        resolution_val = "1024x1024"
+                                                    try:
+                                                        prompt_val = prompt or ""
+                                                    except NameError:
+                                                        prompt_val = ""
+                                                    try:
+                                                        sample_prompt_text_val = sample_prompt_text if sample_prompt_text else None
+                                                    except NameError:
+                                                        sample_prompt_text_val = None
+                                                    
+                                                    # Count images in output directory (more robust than relying on img_files variable)
+                                                    num_images = 0
+                                                    if os.path.exists(output_dir):
+                                                        image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+                                                        for f in os.listdir(output_dir):
+                                                            # Skip sample directory and other non-image files
+                                                            full_path = os.path.join(output_dir, f)
+                                                            if os.path.isfile(full_path) and any(f.lower().endswith(ext) for ext in image_extensions):
+                                                                num_images += 1
+                                                    
+                                                    if num_images == 0:
+                                                        output_queue.put("⚠️ Warning: No images found in output directory for README generation\n")
+                                                    
+                                                    readme_path = generate_lora_readme(
+                                                        output_dir, output_name, trigger_val, num_images,
+                                                        epochs_val, batch_size_val, image_repeats_val, lr_val,
+                                                        rank_val, dims_val, resolution_val, prompt_val, sample_prompt_text_val
+                                                    )
+                                                    if readme_path and os.path.exists(readme_path):
+                                                        output_queue.put(f"📄 LoRA README generated: {readme_path}\n")
+                                                        output_queue.put("   (View README.md link will appear below when training completes)\n")
+                                                        latest_readme_output_dir = output_dir
+                                                    else:
+                                                        output_queue.put(f"⚠️ Warning: README generation failed (file not created at {readme_path if readme_path else 'unknown path'})\n")
+                                                        latest_readme_output_dir = None
+                                                except Exception as e:
+                                                    # Log error but don't fail training if README generation fails
+                                                    import traceback
+                                                    error_details = traceback.format_exc()
+                                                    error_msg = f"⚠️ Warning: README generation failed with error: {str(e)}\n"
+                                                    output_queue.put(error_msg)
+                                                    try:
+                                                        log_file.write(error_msg)
+                                                        log_file.write(f"Traceback: {error_details}\n")
+                                                    except:
+                                                        pass
+                                                
+                                                output_queue.put("="*60 + "\n")
+                                                
+                                                log_file.write("\n" + "="*60 + "\n")
+                                                log_file.write("✅ TRAINING COMPLETED!\n")
+                                                log_file.write("="*60 + "\n")
+                                                log_file.write(f"LoRA file has been saved to: {final_path}\n")
+                                                if os.path.exists(epoch_path):
+                                                    log_file.write(f"And epoch files such as: {epoch_path}\n")
+                                                log_file.write(f"Absolute path: {os.path.abspath(final_path)}\n")
+                                                try:
+                                                    if readme_path and os.path.exists(readme_path):
+                                                        log_file.write(f"LoRA README generated: {readme_path}\n")
+                                                except:
+                                                    pass
+                                                log_file.write("="*60 + "\n")
+                                            elif not ram_aborted:  # Don't show error message if RAM aborted (already handled above)
+                                                output_queue.put("\n" + "="*60 + "\n")
+                                                output_queue.put(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
+                                                output_queue.put("="*60 + "\n")
+                                                output_queue.put(f"See log file for details: {log_path}\n")
+                                                
+                                                log_file.write("\n" + "="*60 + "\n")
+                                                log_file.write(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
+                                                log_file.write("="*60 + "\n")
+                                            
+                                            log_file.write(f"\nTraining finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                            if ram_aborted:
+                                                log_file.write("Reason: RAM usage exceeded 95% threshold.\n")
                                             log_file.flush()
-                                        # Check if process crashed (only if not RAM aborted)
-                                        elif proc.returncode != 0:
-                                            error_msg = f"\n❌ Process exited with code {proc.returncode}\n"
-                                            output_queue.put(error_msg)
-                                            log_file.write(error_msg)
-                                            log_file.flush()
+                                            unregister_process(proc)
+                                        output_queue.put("[TRAINING_FINISHED]\n")  # Signal to close connection
                                     except Exception as e:
-                                        error_msg = f"\n❌ ERROR DURING TRAINING: {str(e)}\n"
-                                        output_queue.put(error_msg)
-                                        log_file.write(error_msg)
-                                        import traceback
-                                        log_file.write(traceback.format_exc())
-                                        log_file.flush()
-                                        if proc.poll() is None:
-                                            proc.terminate()
-                                            proc.wait()
-                                        raise
-                                    
-                                    # Skip success message if RAM aborted
-                                    if ram_aborted:
-                                        # Already logged above, just mark as finished
-                                        pass
-                                    elif proc.returncode == 0:
                                         output_queue.put("\n" + "="*60 + "\n")
-                                        output_queue.put("✅ TRAINING COMPLETED!\n")
-                                        output_queue.put("="*60 + "\n")
-                                        final_path = os.path.join(output_dir, output_name + ".safetensors")
-                                        epoch_path = os.path.join(output_dir, output_name + "-000001.safetensors")
-                                        output_queue.put(f"LoRA file has been saved to: {final_path}\n")
-                                        if os.path.exists(epoch_path):
-                                            output_queue.put(f"And epoch files such as: {epoch_path}\n")
-                                        output_queue.put(f"Absolute path: {os.path.abspath(final_path)}\n")
-                                        output_queue.put(f"Log file: {log_path}\n")
-                                        output_queue.put("="*60 + "\n")
-                                        
-                                        log_file.write("\n" + "="*60 + "\n")
-                                        log_file.write("✅ TRAINING COMPLETED!\n")
-                                        log_file.write("="*60 + "\n")
-                                        log_file.write(f"LoRA file has been saved to: {final_path}\n")
-                                        if os.path.exists(epoch_path):
-                                            log_file.write(f"And epoch files such as: {epoch_path}\n")
-                                        log_file.write(f"Absolute path: {os.path.abspath(final_path)}\n")
-                                        log_file.write("="*60 + "\n")
-                                    elif not ram_aborted:  # Don't show error message if RAM aborted (already handled above)
-                                        output_queue.put("\n" + "="*60 + "\n")
-                                        output_queue.put(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
+                                        output_queue.put(f"❌ ERROR: {str(e)}\n")
                                         output_queue.put("="*60 + "\n")
                                         output_queue.put(f"See log file for details: {log_path}\n")
-                                        
-                                        log_file.write("\n" + "="*60 + "\n")
-                                        log_file.write(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
-                                        log_file.write("="*60 + "\n")
-                                    
-                                    log_file.write(f"\nTraining finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                    if ram_aborted:
-                                        log_file.write("Reason: RAM usage exceeded 95% threshold.\n")
-                                    log_file.flush()
-                                unregister_process(proc)
-                                output_queue.put("[TRAINING_FINISHED]\n")  # Signal to close connection
-                            except Exception as e:
-                                output_queue.put("\n" + "="*60 + "\n")
-                                output_queue.put(f"❌ ERROR: {str(e)}\n")
-                                output_queue.put("="*60 + "\n")
-                                output_queue.put(f"See log file for details: {log_path}\n")
-                                try:
-                                    with open(log_path, "a", encoding="utf-8") as log_f2:
-                                        log_f2.write("\n" + "="*60 + "\n")
-                                        log_f2.write(f"❌ ERROR: {str(e)}\n")
-                                        log_f2.write("="*60 + "\n")
-                                        import traceback
-                                        log_f2.write(traceback.format_exc())
-                                except:
-                                    pass
-                                output_queue.put("[TRAINING_FINISHED]\n")
-                        
-                        # Run training in background thread
-                        training_thread = threading.Thread(target=run_training, daemon=True)
-                        training_thread.start()
-                        
-                        # Return immediately to show streaming output
-                        output_txt = ""  # Will be streamed via SSE
+                                        try:
+                                            with open(log_path, "a", encoding="utf-8") as log_f2:
+                                                log_f2.write("\n" + "="*60 + "\n")
+                                                log_f2.write(f"❌ ERROR: {str(e)}\n")
+                                                log_f2.write("="*60 + "\n")
+                                                import traceback
+                                                log_f2.write(traceback.format_exc())
+                                        except:
+                                            pass
+                                        output_queue.put("[TRAINING_FINISHED]\n")
+                                
+                                # Run training in background thread
+                                training_thread = threading.Thread(target=run_training, daemon=True)
+                                training_thread.start()
+                                
+                                # Return immediately to show streaming output
+                                output_txt = ""  # Will be streamed via SSE
             else:
                 # For non-train actions, still show uploaded images if any
                 if files:

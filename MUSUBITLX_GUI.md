@@ -454,38 +454,7 @@ You will typically see something like:
 
 ---
 
-### 7. Additional Features
-
-- **Caption model unloading**: Before training starts, caption models (ViT-GPT2, BLIP, Qwen-VL) are automatically unloaded from VRAM to free up memory for training.
-
-- **RAM monitoring and protection**: 
-  - System RAM usage is monitored during training.
-  - If RAM exceeds 95%, training is automatically aborted to prevent system lockups.
-  - Caption models are unloaded before training to reduce memory pressure.
-
-- **Training compatibility**: Training settings are optimized for compatibility with various inference settings in ComfyUI and other inference tools.
-
-- **Sample generation**: 
-  - Generate preview images during training to monitor progress.
-  - Customize sample prompts with optional resolution, steps, and seed parameters.
-  - View samples as clickable thumbnails in the GUI.
-  - Auto-refresh every 30 seconds during training.
-  - Generate baseline samples before training for comparison.
-
-- **Log stream resilience**: 
-  - If the browser tab goes to sleep or you reload the page, you can resume the log stream.
-  - The system automatically fetches the latest log content when reconnecting.
-
-- **Warning system**: 
-  - Warning appears if you have too few images (< 8) with recommendations to improve training results.
-  - Info buttons provide helpful tooltips for complex settings (learning rate, LoRA rank/dims).
-
-- **Individual image management**: Remove individual images from the preview without clearing all images.
-
-- **Gradient clipping**: 
-  - `--max_grad_norm 1.0` is automatically added to default training flags to prevent gradient explosion and numerical instability (`avr_loss=nan` issues).
-
-### 8. Credits
+### 7. Credits
 
 - Web GUI: **MusubiTLX**, created by **TLX**.
 - Training core: **Musubi Tuner** (Qwen Image LoRA training scripts).

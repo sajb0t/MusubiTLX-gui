@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, request, send_file, Response, stream_with_context, jsonify
-import subprocess, os, yaml, urllib.request, urllib.parse, shlex
+import subprocess, os, yaml, urllib.request, urllib.parse, shlex, mimetypes
 from werkzeug.utils import secure_filename
 import toml
 import threading
@@ -10,6 +10,10 @@ from datetime import datetime
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "uploads"
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
+
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+OUTPUT_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "output"))
+current_log_path = None
 
 # Global queue for streaming output
 output_queue = queue.Queue()
@@ -66,6 +70,13 @@ def cancel_active_processes():
                 p.terminate()
         except Exception:
             pass
+
+def is_training_active():
+    with active_processes_lock:
+        for proc in active_processes:
+            if proc.poll() is None:
+                return True
+    return False
 
 def _require_caption_deps():
     try:
@@ -341,6 +352,16 @@ HTML = r'''
     .info-tooltip strong { color: #86c6fe; display: block; margin-bottom: 4px; }
     .info-tooltip ul { margin: 6px 0; padding-left: 20px; }
     .info-tooltip li { margin: 4px 0; }
+    .sample-section { background:#1b1f24; border:1px solid #32363f; border-radius:14px; padding:16px 18px; margin-top:18px; }
+    .sample-toggle-row { display:flex; align-items:center; gap:12px; }
+    .sample-toggle-row input[type="checkbox"] { width:auto; transform:scale(1.2); }
+    .sample-gallery { display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; }
+    .sample-card { width:190px; background:#151618; border-radius:12px; padding:10px; box-shadow:0 0 8px rgba(0,0,0,0.4); transition:transform 0.2s ease; }
+    .sample-card:hover { transform:translateY(-3px); box-shadow:0 6px 16px rgba(0,0,0,0.45); }
+    .sample-card a { color:inherit; text-decoration:none; display:block; }
+    .sample-card img, .sample-card video { width:100%; border-radius:8px; object-fit:cover; max-height:150px; background:#0f1012; }
+    .sample-card-meta { font-size:0.85em; color:#bbb; margin-top:6px; word-break:break-word; }
+    .sample-gallery-empty { border:1px dashed #444; border-radius:10px; padding:14px; color:#777; font-size:0.95em; display:flex; justify-content:center; align-items:center; min-height:80px; width:100%; }
   </style>
 </head>
 <body>
@@ -551,6 +572,72 @@ HTML = r'''
               </small>
             </div>
           </div>
+        <div class="sample-section">
+          <div class="sample-toggle-row">
+            <label class="info-icon-wrapper" style="margin:0; gap:10px;">
+              <input type="checkbox" id="samples_enabled" name="samples_enabled" {% if samples_enabled %}checked{% endif %} onchange="toggleSampleOptions(); updateCommandPreview();">
+              <span style="font-weight:600;">Generate sample previews during training</span>
+              <span class="info-icon">
+                ?
+                <span class="info-tooltip">
+                  <strong>Sample previews:</strong>
+                  Runs Qwen inference at checkpoints and saves PNG files under <code>output/.../sample</code>.
+                  <ul>
+                    <li>Costs extra VRAM/time (especially with FP8 offload).</li>
+                    <li>Only enable if you need automatic previews.</li>
+                  </ul>
+                </span>
+              </span>
+            </label>
+          </div>
+          <small style="color:#8ea2be; display:block; margin-top:6px; margin-bottom:12px;">
+            When enabled, the prompts below are saved to <code>sample_prompts.txt</code> inside your output folder and passed to the trainer automatically.
+          </small>
+          <div id="sample-options" style="margin-top:10px; {% if not samples_enabled %}display:none;{% endif %}">
+            <label>Sample prompts (one prompt per line)</label>
+            <textarea id="sample_prompt_text" name="sample_prompt_text" class="advanced-textarea" rows="6" placeholder="# Example prompts (one per line):&#10;A studio portrait of {{trigger}} dressed as a cyberpunk hero --w 960 --h 960 --s 30&#10;{{trigger}} in a fantasy landscape, detailed --w 1024 --h 768 --s 25">{{sample_prompt_text}}</textarea>
+            <small style="color:#888; display:block; margin-top:4px; margin-bottom:8px;">
+              Write prompts with optional parameters. Each line = one sample image.
+              <br>Available parameters: <code>--w</code> (width), <code>--h</code> (height), <code>--s</code> (steps, default: 20), <code>--d</code> (seed), <code>--f</code> (frames, keep 1 for still images).
+              <br>Lines starting with <code>#</code> are comments. Use <code>{{trigger}}</code> to insert your trigger word.
+            </small>
+            <div class="field-group field-group-half" style="margin-top:10px;">
+              <label>Sample every N epochs (0 = disable)</label>
+              <input name="sample_every_epochs" type="number" min="0" value="{% if sample_every_epochs is defined %}{{sample_every_epochs}}{% else %}1{% endif %}" placeholder="1" oninput="updateCommandPreview()">
+              <small style="color:#888; display:block; margin-top:2px;">Default: 1 (sample after each epoch)</small>
+            </div>
+            <div class="field-group field-group-half" style="margin-top:10px;">
+              <label>Sample every N steps (0 = disable)</label>
+              <input name="sample_every_steps" type="number" min="0" value="{% if sample_every_steps is defined %}{{sample_every_steps}}{% else %}0{% endif %}" placeholder="0" oninput="updateCommandPreview()">
+              <small style="color:#888; display:block; margin-top:2px;">Default: 0 (use epochs instead)</small>
+            </div>
+            <div class="sample-toggle-row" style="margin-top:10px;">
+              <label class="info-icon-wrapper" style="margin:0; gap:10px;">
+                <input type="checkbox" id="sample_at_first" name="sample_at_first" {% if sample_at_first %}checked{% endif %} onchange="updateCommandPreview()">
+                <span style="font-weight:600;">Generate baseline samples before training starts</span>
+                <span class="info-icon">
+                  ?
+                  <span class="info-tooltip">
+                    <strong>Baseline Samples:</strong>
+                    Generate sample images before training begins (with the untrained model) so you can compare before/after results.
+                    <br><br>
+                    This helps you see how much the model improves during training and verify that sample generation works correctly.
+                  </span>
+                </span>
+              </label>
+            </div>
+            <div style="margin-top:18px;">
+              <button type="button" onclick="refreshSampleGallery()" style="background:#7a5cff;">Refresh sample gallery</button>
+              <small style="color:#888; display:block; margin-top:4px;">
+                Uses the current output folder (shown above). Samples save to <code>{{output_dir if output_dir else 'output'}}/sample/</code>.
+              </small>
+            </div>
+            <div id="sample-gallery-status" class="status-box" style="display:none; margin-top:10px;"></div>
+            <div id="sample-gallery" class="sample-gallery sample-gallery-empty" style="margin-top:12px;">
+              <span>No sample previews found yet.</span>
+            </div>
+          </div>
+        </div>
         </div>
         <div style="color:#aaa; font-size:0.9em; margin-bottom:6px; margin-top:4px;">
           <span id="time-estimate">Estimated training time: add images and adjust epochs/batch size.</span>
@@ -622,8 +709,14 @@ HTML = r'''
     </div>
     <div id="output-container" style="display:none;">
       <div class="output">
-        <strong>Training log:</strong><br>
-        <pre id="output-text" style="max-height: 500px; overflow-y: auto;"></pre>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <strong>Training log:</strong>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button type="button" onclick="resumeLogStream()">Resume log stream</button>
+            <small id="log-resume-status" style="color:#8ea2be; display:none;"></small>
+          </div>
+        </div>
+        <pre id="output-text" style="max-height: 500px; overflow-y: auto; margin-top:10px;"></pre>
       </div>
     </div>
     <div class="footer">
@@ -636,6 +729,9 @@ HTML = r'''
     async function updateSystemResources() {
       try {
         const response = await fetch('/system_resources');
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
         const data = await response.json();
         
         const ramInfo = document.getElementById('ram-info');
@@ -680,6 +776,64 @@ HTML = r'''
           vramInfo.textContent = 'Error loading';
           vramInfo.style.color = '#ff6666';
         }
+      }
+    }
+
+    function ensureOutputVisible() {
+      const container = document.getElementById('output-container');
+      if (container && container.style.display !== "block") {
+        container.style.display = "block";
+      }
+    }
+
+    function setLogStatus(message, isError = false) {
+      const statusEl = document.getElementById('log-resume-status');
+      if (!statusEl) return;
+      if (!message) {
+        statusEl.style.display = "none";
+        statusEl.textContent = "";
+        return;
+      }
+      statusEl.style.display = "inline";
+      statusEl.style.color = isError ? "#ff8080" : "#8ea2be";
+      statusEl.textContent = message;
+    }
+
+    async function loadCurrentLog(showStatus = false) {
+      try {
+        const resp = await fetch('/current_log');
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (typeof data.log_content === "string") {
+          ensureOutputVisible();
+          const outputText = document.getElementById("output-text");
+          outputText.textContent = data.log_content;
+          outputText.scrollTop = outputText.scrollHeight;
+        }
+        if (showStatus) {
+          if (data.training_active) {
+            setLogStatus("Training is running. Live stream available.", false);
+          } else if (data.log_content) {
+            setLogStatus("Training finished. Showing latest log.", false);
+          } else {
+            setLogStatus("No log data available yet.", true);
+          }
+        }
+        return data;
+      } catch (err) {
+        console.error('Failed to load log file:', err);
+        setLogStatus(`Failed to load log: ${err.message}`, true);
+        return null;
+      }
+    }
+
+    async function resumeLogStream() {
+      const data = await loadCurrentLog(true);
+      if (data && data.training_active) {
+        setLogStatus("Live stream reconnected...", false);
+        openLogStream();
       }
     }
     
@@ -897,6 +1051,25 @@ HTML = r'''
       desc.textContent = descriptions[level] || 'Standard';
     }
 
+    function computeFinalOutputDir() {
+      const baseOutput = "output";
+      const outputDirInput = document.querySelector('input[name="output_dir"]');
+      let userOutputDir = outputDirInput ? (outputDirInput.value || "") : "";
+      userOutputDir = userOutputDir.trim().replace(/\\/g, "/");
+      userOutputDir = userOutputDir.replace(/^\/+/, "").replace(/\s+$/, "");
+      if (!userOutputDir) {
+        return baseOutput;
+      }
+      return `${baseOutput}/${userOutputDir}`.replace(/\/+/g, "/");
+    }
+
+    function markSampleGalleryPending(message) {
+      const gallery = document.getElementById('sample-gallery');
+      if (!gallery) return;
+      gallery.innerHTML = `<span>${message || "Output folder changed. Click refresh to load samples."}</span>`;
+      gallery.classList.add('sample-gallery-empty');
+    }
+
     function updateFinalPath() {
       const outputDirInput = document.querySelector('input[name="output_dir"]');
       const outputNameInput = document.querySelector('input[name="output_name"]');
@@ -904,19 +1077,12 @@ HTML = r'''
       
       if (!outputDirInput || !outputNameInput || !finalPathPreview) return;
       
-      const userOutputDir = (outputDirInput.value || "").trim();
       const outputName = (outputNameInput.value || "lora").trim();
-      
-      // Build the path: output/subdir/lora.safetensors
-      // If userOutputDir is empty, just use "output/lora.safetensors"
-      let finalPath;
-      if (userOutputDir) {
-        finalPath = `output/${userOutputDir}/${outputName}.safetensors`;
-      } else {
-        finalPath = `output/${outputName}.safetensors`;
-      }
+      const finalOutDir = computeFinalOutputDir();
+      const finalPath = `${finalOutDir}/${outputName}.safetensors`.replace(/\/+/g, "/");
       
       finalPathPreview.textContent = finalPath;
+      markSampleGalleryPending("Output folder changed. Click refresh to load samples.");
     }
 
     function toggleAdvancedFlags() {
@@ -926,6 +1092,90 @@ HTML = r'''
       const visible = panel.style.display === "block";
       panel.style.display = visible ? "none" : "block";
       toggle.textContent = visible ? "Show advanced trainer flags" : "Hide advanced trainer flags";
+      // Update preview when panel is opened
+      if (!visible) {
+        updateCommandPreview();
+      }
+    }
+
+    function toggleSampleOptions() {
+      const checkbox = document.getElementById('samples_enabled');
+      const options = document.getElementById('sample-options');
+      if (!checkbox || !options) return;
+      options.style.display = checkbox.checked ? "block" : "none";
+    }
+
+    function setSampleGalleryStatus(message, isError) {
+      const statusEl = document.getElementById('sample-gallery-status');
+      if (!statusEl) return;
+      if (!message) {
+        statusEl.style.display = "none";
+        statusEl.textContent = "";
+        return;
+      }
+      statusEl.style.display = "block";
+      statusEl.style.color = isError ? "#ff8080" : "#b3daff";
+      statusEl.textContent = message;
+    }
+
+    function renderSampleGallery(files) {
+      const gallery = document.getElementById('sample-gallery');
+      if (!gallery) return;
+      gallery.innerHTML = "";
+      if (!files || files.length === 0) {
+        gallery.classList.add('sample-gallery-empty');
+        gallery.innerHTML = "<span>No sample previews found for the current output folder.</span>";
+        return;
+      }
+      gallery.classList.remove('sample-gallery-empty');
+      files.forEach(file => {
+        const card = document.createElement('div');
+        card.className = "sample-card";
+        const media =
+          file.kind === "video"
+            ? `<video src="${file.url}" muted loop playsinline></video>`
+            : `<img src="${file.url}" alt="${file.name} thumbnail">`;
+        const timestamp = file.mtime_display || "";
+        card.innerHTML = `
+          <a href="${file.url}" target="_blank" rel="noopener">
+            ${media}
+            <div class="sample-card-meta">${file.name}</div>
+            <div class="sample-card-meta" style="color:#888;">${timestamp}</div>
+          </a>
+        `;
+        gallery.appendChild(card);
+      });
+    }
+
+    async function refreshSampleGallery(auto=false) {
+      const finalOutDir = computeFinalOutputDir();
+      const gallery = document.getElementById('sample-gallery');
+      if (!gallery) return;
+      if (!finalOutDir) {
+        renderSampleGallery([]);
+        setSampleGalleryStatus("No output folder selected.", true);
+        return;
+      }
+      setSampleGalleryStatus("Loading sample previews...", false);
+      try {
+        const resp = await fetch(`/list_samples?output_dir=${encodeURIComponent(finalOutDir)}`);
+        if (!resp.ok) {
+          throw new Error(`Server responded with ${resp.status}`);
+        }
+        const data = await resp.json();
+        renderSampleGallery(data.files || []);
+        if (data.files && data.files.length) {
+          setSampleGalleryStatus(`Showing ${data.files.length} sample file${data.files.length > 1 ? "s" : ""}.`, false);
+        } else if (auto) {
+          setSampleGalleryStatus("No samples found yet for this run.", false);
+        } else {
+          setSampleGalleryStatus("No sample previews found. Run training with samples enabled, then refresh.", false);
+        }
+      } catch (err) {
+        console.error("Failed to load sample gallery:", err);
+        setSampleGalleryStatus(`Failed to load samples: ${err.message}`, true);
+        renderSampleGallery([]);
+      }
     }
 
     function buildDefaultExtraFlags(vramProfile) {
@@ -933,23 +1183,28 @@ HTML = r'''
       // 12GB VRAM GPU: Use blocks_to_swap 45 → ~12GB VRAM usage (safest, most offload to RAM)
       // Note: gradient_checkpointing_cpu_offload is removed to avoid CUDA alignment issues with fp8_scaled
       if (vramProfile === "12") {
-        return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 45 --gradient_checkpointing --max_grad_norm 1.0";
       }
       // 16GB VRAM GPU: Use blocks_to_swap 30 → ~16-18GB VRAM usage (balanced, faster than 12GB profile)
       // blocks_to_swap 16 would need 24GB VRAM which doesn't fit on 16GB cards
       // blocks_to_swap 30 is a middle ground that should give ~16-18GB VRAM usage
       if (vramProfile === "16") {
-        return "--fp8_base --fp8_scaled --blocks_to_swap 30 --gradient_checkpointing";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 30 --gradient_checkpointing --max_grad_norm 1.0";
       }
       // 24GB+ VRAM GPU: Can use blocks_to_swap 16 → ~24GB VRAM usage (fastest, minimal offload)
       if (vramProfile === "24") {
-        return "--fp8_base --fp8_scaled --blocks_to_swap 16 --gradient_checkpointing";
+        return "--fp8_base --fp8_scaled --blocks_to_swap 16 --gradient_checkpointing --max_grad_norm 1.0";
       }
       return "";
     }
 
     function syncAdvancedFlagsFromGui(initial) {
       const advFlagsInput = document.querySelector('textarea[name="advanced_flags"]');
+      const samplesCheckbox = document.getElementById('samples_enabled');
+      const samplePromptTextarea = document.getElementById('sample_prompt_text');
+      const sampleEveryEpochsInput = document.querySelector('input[name="sample_every_epochs"]');
+      const sampleEveryStepsInput = document.querySelector('input[name="sample_every_steps"]');
+      const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
       const vramSelect = document.querySelector('select[name="vram_profile"]');
       if (!advFlagsInput || !vramSelect) return;
 
@@ -988,6 +1243,11 @@ HTML = r'''
       const outNameInput = document.querySelector('input[name="output_name"]');
       const optSelect = document.querySelector('select[name="optimizer_type"]');
       const advFlagsInput = document.querySelector('textarea[name="advanced_flags"]');
+      const samplesCheckbox = document.getElementById('samples_enabled');
+      const samplePromptTextarea = document.getElementById('sample_prompt_text');
+      const sampleEveryEpochsInput = document.querySelector('input[name="sample_every_epochs"]');
+      const sampleEveryStepsInput = document.querySelector('input[name="sample_every_steps"]');
+      const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
 
       const vramProfile = vramSelect ? (vramSelect.value || "12") : "12";
       const epochs = epochsInput ? (epochsInput.value || "6") : "6";
@@ -997,13 +1257,16 @@ HTML = r'''
       const dims = dimsInput ? (dimsInput.value || "128") : "128";
       const seed = seedInput ? (seedInput.value || "42") : "42";
       const resolution = resInput ? (resInput.value || "1024x1024") : "1024x1024";
-      const userOutDir = outDirInput ? (outDirInput.value || "") : "";
       const outputName = outNameInput ? (outNameInput.value || "lora") : "lora";
       const optimizer = optSelect ? (optSelect.value || "AdamW") : "AdamW";
       const advFlagsText = advFlagsInput ? (advFlagsInput.value || "") : "";
+      const samplesEnabled = samplesCheckbox ? samplesCheckbox.checked : false;
+      const samplePromptText = samplePromptTextarea ? (samplePromptTextarea.value || "") : "";
+      const sampleEveryEpochs = sampleEveryEpochsInput ? parseInt(sampleEveryEpochsInput.value || "0") : 0;
+      const sampleEverySteps = sampleEveryStepsInput ? parseInt(sampleEveryStepsInput.value || "0") : 0;
+      const sampleAtFirst = sampleAtFirstCheckbox ? sampleAtFirstCheckbox.checked : false;
 
-      const baseOutput = "output";
-      const finalOutDir = userOutDir ? (baseOutput + "/" + userOutDir) : baseOutput;
+      const finalOutDir = computeFinalOutputDir();
       const datasetConfig = finalOutDir + "/dataset_config.toml";
 
       const ditModel = "qwen_image_bf16.safetensors";
@@ -1038,8 +1301,26 @@ HTML = r'''
         cmdParts = cmdParts.concat(extra);
       }
 
+      if (samplesEnabled && samplePromptText.trim() !== "") {
+        const samplePromptPath = finalOutDir + "/sample_prompts.txt";
+        cmdParts.push("--sample_prompts", samplePromptPath);
+        if (!isNaN(sampleEveryEpochs) && sampleEveryEpochs > 0) {
+          cmdParts.push("--sample_every_n_epochs", String(sampleEveryEpochs));
+        }
+        if (!isNaN(sampleEverySteps) && sampleEverySteps > 0) {
+          cmdParts.push("--sample_every_n_steps", String(sampleEverySteps));
+        }
+        if (sampleAtFirst) {
+          cmdParts.push("--sample_at_first");
+        }
+      }
+
       const cmdString = cmdParts.map(p => (/\s/.test(p) ? `"${p}"` : p)).join(" ");
-      preview.textContent = cmdString;
+      if (preview) {
+        preview.textContent = cmdString;
+      } else {
+        console.warn('cmd-preview element not found');
+      }
     }
 
     async function autoCaptionCaptionModel() {
@@ -1187,10 +1468,53 @@ HTML = r'''
     let sseBuffer = "";
     let lastSseFlush = 0;
     const SSE_FLUSH_INTERVAL_MS = 8000; // flush to UI at most ~every 8 seconds
-    function startTraining() {
-      showSpinner();
+    
+    // Auto-refresh sample gallery during training
+    let sampleGalleryPollInterval = null;
+    const SAMPLE_GALLERY_POLL_INTERVAL_MS = 30000; // Check for new samples every 30 seconds
+    let lastSampleFileCount = 0;
+
+    function startSampleGalleryPolling() {
+      // Clear any existing interval
+      if (sampleGalleryPollInterval) {
+        clearInterval(sampleGalleryPollInterval);
+      }
+      lastSampleFileCount = 0;
       
-      // 1. Connect to stream immediately
+      // Start polling for new samples
+      sampleGalleryPollInterval = setInterval(async () => {
+        const finalOutDir = computeFinalOutputDir();
+        if (!finalOutDir) return;
+        
+        try {
+          const resp = await fetch(`/list_samples?output_dir=${encodeURIComponent(finalOutDir)}`);
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const files = data.files || [];
+          
+          // If we found new files, refresh the gallery silently
+          if (files.length > lastSampleFileCount) {
+            const newCount = files.length - lastSampleFileCount;
+            lastSampleFileCount = files.length;
+            renderSampleGallery(files);
+            // Update status briefly to show new samples were found
+            setSampleGalleryStatus(`${files.length} sample file${files.length > 1 ? "s" : ""} (${newCount} new)`, false);
+          }
+        } catch (err) {
+          // Silent fail - don't spam errors during polling
+        }
+      }, SAMPLE_GALLERY_POLL_INTERVAL_MS);
+    }
+
+    function stopSampleGalleryPolling() {
+      if (sampleGalleryPollInterval) {
+        clearInterval(sampleGalleryPollInterval);
+        sampleGalleryPollInterval = null;
+      }
+    }
+
+    function openLogStream() {
+      ensureOutputVisible();
       if (eventSource) eventSource.close();
       eventSource = new EventSource('/stream');
       
@@ -1198,14 +1522,13 @@ HTML = r'''
         const outputText = document.getElementById("output-text");
         const data = event.data;
         
-        // Skip empty messages
         if (!data || data.trim() === "") {
           return;
         }
         
-        // If training aborted with error (including OOM), stop spinner and re‑enable buttons
         if (data.includes("TRAINING ABORTED WITH ERROR") || data.includes("torch.OutOfMemoryError")) {
           document.getElementById("spinner").style.display = "none";
+          stopSampleGalleryPolling();
           if (eventSource) {
             eventSource.close();
             eventSource = null;
@@ -1221,15 +1544,16 @@ HTML = r'''
           const outputContainer = document.getElementById("output-container");
           outputContainer.style.border = "3px solid #ff5555";
           outputContainer.style.borderRadius = "10px";
-          // fall through to still append the error line to the log
+          refreshSampleGallery(true);
         }
         
-        // Check if training is finished (success or handled error)
         if (data.includes("[TRAINING_FINISHED]")) {
           document.getElementById("spinner").style.display = "none";
-          eventSource.close();
-          eventSource = null;
-          // Re‑enable buttons after training
+          stopSampleGalleryPolling();
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
           const startBtn = document.getElementById("start-btn");
           const cancelBtn = document.getElementById("cancel-btn");
           const saveYamlBtn = document.getElementById("saveyaml-btn");
@@ -1238,14 +1562,13 @@ HTML = r'''
           if (cancelBtn) cancelBtn.disabled = true;
           if (saveYamlBtn) saveYamlBtn.disabled = false;
           if (loadYamlBtn) loadYamlBtn.disabled = false;
-          // Show completion highlight
           const outputContainer = document.getElementById("output-container");
           outputContainer.style.border = "3px solid #00ff00";
           outputContainer.style.borderRadius = "10px";
+          refreshSampleGallery(true);
           return;
         }
         
-        // Buffer SSE messages and flush to UI at most every SSE_FLUSH_INTERVAL_MS
         const processedData = data + "\n";
         sseBuffer += processedData;
         const now = Date.now();
@@ -1259,15 +1582,23 @@ HTML = r'''
       
       eventSource.onerror = function(event) {
         if (eventSource.readyState === EventSource.CLOSED) {
-             // Connection closed normally
         } else {
-             // Error occurred
              console.error("EventSource error:", event);
-             // Don't close immediately, it might reconnect
         }
       };
+    }
 
-      // 2. Submit form via AJAX to prevent page reload
+    function startTraining() {
+      showSpinner();
+      openLogStream();
+      
+      // Start auto-refreshing sample gallery during training
+      const samplesCheckbox = document.getElementById('samples_enabled');
+      if (samplesCheckbox && samplesCheckbox.checked) {
+        startSampleGalleryPolling();
+      }
+      
+      // Submit form via AJAX to prevent page reload
       var form = document.getElementById('training-form');
       var formData = new FormData(form);
       formData.append('action', 'train'); // Manually add action since we are not using submit button
@@ -1279,16 +1610,19 @@ HTML = r'''
       .then(response => {
         if (!response.ok) {
             document.getElementById("output-text").textContent += "❌ Server error when starting training: " + response.statusText + "\n";
+            stopSampleGalleryPolling();
         }
       })
       .catch(error => {
             document.getElementById("output-text").textContent += "❌ Network error when starting training: " + error + "\n";
+            stopSampleGalleryPolling();
       });
     }
 
     async function cancelTraining() {
       const confirmCancel = window.confirm("Are you sure you want to cancel the current training run?");
       if (!confirmCancel) return;
+      stopSampleGalleryPolling();
       const statusEl = document.getElementById('autocap-status');
       try {
         const resp = await fetch('/cancel_training', { method: 'POST' });
@@ -1305,49 +1639,78 @@ HTML = r'''
     
     // Auto-start streaming when page loads with training in progress
     window.addEventListener('load', function() {
-      const spinner = document.getElementById("spinner");
-      if (spinner && spinner.style.display === "block") {
-        startTraining();
+      // Start system resources monitoring immediately (non-blocking)
+      try {
+        updateSystemResources();
+        setInterval(updateSystemResources, 3000);
+      } catch (err) {
+        console.error('Failed to initialize system resources monitoring:', err);
       }
-      setupDropzone();
-      // Attach listeners to keep command preview in sync with form values
-      const names = [
-        "epochs","batch_size","image_repeats","lr","resolution",
-        "seed","rank","dims","output_dir","output_name"
-      ];
-      names.forEach(n => {
-        const el = document.querySelector('input[name="' + n + '"]');
-        if (el) {
-          el.addEventListener('input', updateCommandPreview);
-          el.addEventListener('change', updateCommandPreview);
-        }
-      });
-      const vramSel = document.querySelector('select[name="vram_profile"]');
-      if (vramSel) {
-        vramSel.addEventListener('change', function() {
-          syncAdvancedFlagsFromGui(false);
-        });
-      }
-      const optSel = document.querySelector('select[name="optimizer_type"]');
-      if (optSel) {
-        optSel.addEventListener('change', updateCommandPreview);
-      }
-      const advFlags = document.querySelector('textarea[name="advanced_flags"]');
-      if (advFlags) {
-        advFlags.addEventListener('input', function() {
-          advFlagsDirty = true;
-          updateCommandPreview();
-        });
-      }
-      syncAdvancedFlagsFromGui(true);
-      updateCommandPreview();
-      updateCaptionLengthLabel();
-      updateDetailLevelLabel();
-      updateFinalPath();
       
-      // Update system resources when page loads and every 3 seconds
-      updateSystemResources();
-      setInterval(updateSystemResources, 3000);
+      try {
+        const spinner = document.getElementById("spinner");
+        if (spinner && spinner.style.display === "block") {
+          startTraining();
+        }
+        setupDropzone();
+        // Attach listeners to keep command preview in sync with form values
+        const names = [
+          "epochs","batch_size","image_repeats","lr","resolution",
+          "seed","rank","dims","output_dir","output_name",
+          "sample_every_epochs","sample_every_steps"
+        ];
+        names.forEach(n => {
+          const el = document.querySelector('input[name="' + n + '"]');
+          if (el) {
+            el.addEventListener('input', updateCommandPreview);
+            el.addEventListener('change', updateCommandPreview);
+          }
+        });
+        const vramSel = document.querySelector('select[name="vram_profile"]');
+        if (vramSel) {
+          vramSel.addEventListener('change', function() {
+            syncAdvancedFlagsFromGui(false);
+          });
+        }
+        const optSel = document.querySelector('select[name="optimizer_type"]');
+        if (optSel) {
+          optSel.addEventListener('change', updateCommandPreview);
+        }
+        const advFlags = document.querySelector('textarea[name="advanced_flags"]');
+        if (advFlags) {
+          advFlags.addEventListener('input', function() {
+            advFlagsDirty = true;
+            updateCommandPreview();
+          });
+        }
+        const samplePromptTextarea = document.getElementById('sample_prompt_text');
+        if (samplePromptTextarea) {
+          samplePromptTextarea.addEventListener('input', updateCommandPreview);
+        }
+        const samplesCheckbox = document.getElementById('samples_enabled');
+        if (samplesCheckbox) {
+          samplesCheckbox.addEventListener('change', updateCommandPreview);
+        }
+        const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
+        if (sampleAtFirstCheckbox) {
+          sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
+        }
+        syncAdvancedFlagsFromGui(true);
+        toggleSampleOptions();
+        updateCommandPreview();
+        updateCaptionLengthLabel();
+        updateDetailLevelLabel();
+        updateFinalPath();
+        
+        // Load sample gallery (non-blocking, errors won't stop other functionality)
+        try {
+          refreshSampleGallery(true);
+        } catch (err) {
+          console.error('Failed to load sample gallery on page load:', err);
+        }
+      } catch (err) {
+        console.error('Error during page initialization:', err);
+      }
     });
   </script>
 </body>
@@ -1357,6 +1720,23 @@ HTML = r'''
 def ensure_dir(d):
     if not os.path.isdir(d):
         os.makedirs(d)
+
+def resolve_output_path(rel_path: str) -> str:
+    """
+    Ensure a path stays inside the project output directory.
+    Accepts strings that start with 'output'.
+    """
+    if not rel_path:
+        raise ValueError("Empty path")
+    normalized = rel_path.replace("\\", "/")
+    if normalized.startswith("/"):
+        normalized = normalized.lstrip("/")
+    if not normalized.startswith("output"):
+        raise ValueError("Path must stay inside output/")
+    abs_path = os.path.abspath(os.path.join(PROJECT_ROOT, normalized))
+    if not abs_path.startswith(OUTPUT_ROOT):
+        raise ValueError("Path escapes output directory")
+    return abs_path
 
 def save_uploaded_images(files, captions, output_dir, trigger_word=""):
     ensure_dir(output_dir)
@@ -1748,6 +2128,97 @@ def cancel_training():
     output_queue.put("[TRAINING_FINISHED]\n")
     return jsonify({"status": "ok"})
 
+@app.route("/list_samples")
+def list_samples():
+    output_dir = (request.args.get("output_dir") or "").strip()
+    if not output_dir:
+        return jsonify({"files": []})
+    try:
+        sample_dir = resolve_output_path(os.path.join(output_dir, "sample"))
+    except ValueError:
+        return jsonify({"files": []}), 400
+    if not os.path.isdir(sample_dir):
+        return jsonify({"files": []})
+    entries = []
+    try:
+        filenames = sorted(
+            [f for f in os.listdir(sample_dir) if os.path.isfile(os.path.join(sample_dir, f))],
+            key=lambda name: os.path.getmtime(os.path.join(sample_dir, name)),
+            reverse=True,
+        )
+    except OSError:
+        filenames = []
+    allowed_ext = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".mp4",
+        ".mov",
+        ".webm",
+    }
+    for fname in filenames[:36]:
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in allowed_ext:
+            continue
+        rel_path = f"{output_dir}/sample/{fname}".replace("//", "/")
+        try:
+            abs_path = resolve_output_path(rel_path)
+        except ValueError:
+            continue
+        try:
+            stat = os.stat(abs_path)
+            mtime_display = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            mtime_display = ""
+        entries.append(
+            {
+                "name": fname,
+                "kind": "video" if ext in {".mp4", ".mov", ".webm"} else "image",
+                "url": f"/sample_file?path={urllib.parse.quote(rel_path)}",
+                "mtime_display": mtime_display,
+            }
+        )
+    return jsonify({"files": entries})
+
+@app.route("/sample_file")
+def sample_file():
+    rel_path = (request.args.get("path") or "").strip()
+    if not rel_path:
+        return "Missing path", 400
+    try:
+        abs_path = resolve_output_path(rel_path)
+    except ValueError:
+        return "Invalid path", 400
+    if not os.path.isfile(abs_path):
+        return "Not found", 404
+    mime, _ = mimetypes.guess_type(abs_path)
+    return send_file(abs_path, mimetype=mime or "application/octet-stream")
+
+@app.route("/current_log")
+def current_log():
+    log_path = current_log_path
+    log_content = ""
+    if log_path and os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                tail_bytes = 200000  # ~200 KB tail
+                f.seek(max(0, size - tail_bytes))
+                log_content = f.read()
+        except Exception as e:
+            return jsonify({"error": f"Failed to read log: {e}", "training_active": is_training_active()}), 500
+
+    return jsonify(
+        {
+            "log_path": log_path,
+            "log_content": log_content,
+            "training_active": is_training_active(),
+        }
+    )
+
 @app.route("/uploads/<filename>")
 def uploaded_image(filename):
     return send_file(os.path.join(app.config["UPLOAD_FOLDER"], filename))
@@ -1872,6 +2343,7 @@ def stream():
 
 @app.route("/", methods=["GET", "POST"])
 def gui():
+    global current_log_path
     download_msg = ""
     uploaded_gallery = []
     trigger = "subjectword"
@@ -1898,6 +2370,11 @@ def gui():
     dims = 128
     image_repeats = 10
     advanced_flags = ""
+    samples_enabled = False
+    sample_prompt_text = ""
+    sample_every_epochs = 1
+    sample_every_steps = 0
+    sample_at_first = False
     output_dir = ""  # Empty means use default "output" directory
     output_name = "lora"
     saved_yaml = ""
@@ -1933,6 +2410,19 @@ def gui():
             optimizer_type = request.form.get("optimizer_type", "AdamW")
             output_name = request.form.get("output_name", output_name)
             advanced_flags = request.form.get("advanced_flags", advanced_flags)
+            samples_enabled = request.form.get("samples_enabled") == "on"
+            sample_prompt_text = request.form.get("sample_prompt_text", sample_prompt_text)
+            sample_every_epochs = request.form.get("sample_every_epochs", sample_every_epochs)
+            sample_every_steps = request.form.get("sample_every_steps", sample_every_steps)
+            sample_at_first = request.form.get("sample_at_first") == "on"
+            try:
+                sample_every_epochs = int(sample_every_epochs) if str(sample_every_epochs).strip() else 0
+            except (ValueError, TypeError):
+                sample_every_epochs = 0
+            try:
+                sample_every_steps = int(sample_every_steps) if str(sample_every_steps).strip() else 0
+            except (ValueError, TypeError):
+                sample_every_steps = 0
             # Always use "output" as base directory, and create subdirectory if specified
             base_output_dir = "output"
             user_output_dir = request.form.get("output_dir", "").strip()
@@ -1973,6 +2463,19 @@ def gui():
                             user_output_dir = output_dir
                         output_name = cfg.get("output_name", output_name)
                         advanced_flags = cfg.get("advanced_flags", advanced_flags)
+                        samples_enabled = bool(cfg.get("samples_enabled", samples_enabled))
+                        sample_prompt_text = cfg.get("sample_prompt_text", sample_prompt_text)
+                        sample_every_epochs = cfg.get("sample_every_epochs", sample_every_epochs)
+                        sample_every_steps = cfg.get("sample_every_steps", sample_every_steps)
+                        sample_at_first = bool(cfg.get("sample_at_first", sample_at_first))
+                        try:
+                            sample_every_epochs = int(sample_every_epochs)
+                        except (ValueError, TypeError):
+                            sample_every_epochs = 0
+                        try:
+                            sample_every_steps = int(sample_every_steps)
+                        except (ValueError, TypeError):
+                            sample_every_steps = 0
                         # Optional: image_repeats, if present
                         if "image_repeats" in cfg:
                             image_repeats = cfg.get("image_repeats", image_repeats)
@@ -2001,6 +2504,8 @@ def gui():
             # Generate dataset TOML with image repeats
             image_repeats = request.form.get("image_repeats", image_repeats)
             dataset_config = write_dataset_config_toml(output_dir, batch_size, resolution, image_repeats)
+            sample_prompt_path = None
+
             config_dict = dict(
                 trigger_word=trigger,
                 vram_profile=vram_profile,
@@ -2019,6 +2524,11 @@ def gui():
                 vae_model=vae_model,
                 text_encoder=text_encoder,
                 advanced_flags=str(advanced_flags or ""),
+                samples_enabled=bool(samples_enabled),
+                sample_prompt_text=sample_prompt_text,
+                sample_every_epochs=sample_every_epochs,
+                sample_every_steps=sample_every_steps,
+                sample_at_first=bool(sample_at_first),
             )
             # Extra args are now fully controlled by the Advanced flags textarea (kept in sync with VRAM profile by JS)
             extra_args = []
@@ -2038,22 +2548,39 @@ def gui():
                     if not img_files:
                         output_txt = "ERROR: Failed to save uploaded images. Please check file permissions and try again."
                     else:
-                        # Show uploaded images in gallery
-                        for idx, fname in enumerate(img_files):
-                            cap = captions[idx] if idx < len(captions) else ""
-                            uploaded_gallery.append((fname, cap))
-                        # Clear output queue
-                        while not output_queue.empty():
-                            try:
-                                output_queue.get_nowait()
-                            except queue.Empty:
-                                break
+                        validation_error = ""
+                        sample_prompt_path = None
+                        if samples_enabled:
+                            cleaned_prompt = (sample_prompt_text or "").strip()
+                            if not cleaned_prompt:
+                                validation_error = "ERROR: Sample previews are enabled but no sample prompts were provided."
+                            else:
+                                sample_prompt_path = os.path.join(output_dir, "sample_prompts.txt")
+                                ensure_dir(output_dir)
+                                normalized_text = cleaned_prompt.replace("\r\n", "\n")
+                                with open(sample_prompt_path, "w", encoding="utf-8") as sp_file:
+                                    sp_file.write(normalized_text.rstrip() + "\n")
+                        if validation_error:
+                            output_txt = validation_error
+                        else:
+                            # Show uploaded images in gallery
+                            for idx, fname in enumerate(img_files):
+                                cap = captions[idx] if idx < len(captions) else ""
+                                uploaded_gallery.append((fname, cap))
+                            # Clear output queue
+                            while not output_queue.empty():
+                                try:
+                                    output_queue.get_nowait()
+                                except queue.Empty:
+                                    break
                         
                         # Create log file with timestamp
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         log_filename = f"training_log_{output_name}_{timestamp}.log"
                         log_path = os.path.join(output_dir, log_filename)
                         ensure_dir(output_dir)
+                        global current_log_path
+                        current_log_path = log_path
                         
                         # Unload caption models to free VRAM before training
                         output_queue.put("[Unloading caption models from VRAM...]\n")
@@ -2119,6 +2646,19 @@ def gui():
                         if str(vram_profile) in ["12", "16"]:
                             cmd.append("--fp8_vl")
 
+                        # Add sample flags if samples are enabled
+                        if samples_enabled and sample_prompt_path and os.path.exists(sample_prompt_path):
+                            cmd.append("--sample_prompts")
+                            cmd.append(sample_prompt_path)
+                            if sample_every_epochs and int(sample_every_epochs) > 0:
+                                cmd.append("--sample_every_n_epochs")
+                                cmd.append(str(sample_every_epochs))
+                            if sample_every_steps and int(sample_every_steps) > 0:
+                                cmd.append("--sample_every_n_steps")
+                                cmd.append(str(sample_every_steps))
+                            if sample_at_first:
+                                cmd.append("--sample_at_first")
+                        
                         # Append any manually specified advanced flags from the GUI
                         manual_flags = []
                         if advanced_flags:
@@ -2335,8 +2875,10 @@ def gui():
         prompt=prompt, resolution=resolution, seed=seed, rank=rank, dims=dims,
         output_dir=output_dir, user_output_dir=user_output_dir, output_name=output_name, image_repeats=image_repeats,
         advanced_flags=advanced_flags,
+        samples_enabled=samples_enabled, sample_prompt_text=sample_prompt_text,
+        sample_every_epochs=sample_every_epochs, sample_every_steps=sample_every_steps, sample_at_first=sample_at_first,
         saved_yaml=saved_yaml, output_txt=output_txt,
-        uploaded_gallery=uploaded_gallery
+        uploaded_gallery=uploaded_gallery, optimizer_type=optimizer_type
     )
 
 if __name__ == "__main__":

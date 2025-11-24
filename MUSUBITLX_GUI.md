@@ -66,14 +66,35 @@ Musubi Tuner itself is developed in the main project repository: [Musubi Tuner](
     - Text encoder cache
     - LoRA training
   - Output is shown line‑by‑line and auto‑scrolls.
+  - **Resume log stream**: If the browser tab goes to sleep (e.g., computer sleeps) or you reload the page, you can click "Resume log stream" to reconnect and fetch the latest log content automatically.
+
+- **Sample generation during training**
+  - Enable automatic sample image generation at training checkpoints.
+  - Configure sample frequency (every N epochs or every N steps).
+  - Edit sample prompts directly in the GUI with support for parameters (`--w`, `--h`, `--s`, `--d`, `--f`).
+  - Option to generate baseline samples before training starts for before/after comparison.
+  - Default resolution for samples is 256×256 (if not specified in prompts).
+  - Default seed is used if not specified in prompts.
+
+- **Sample gallery**
+  - View generated sample images as clickable thumbnails directly in the GUI.
+  - Automatically refreshes every 30 seconds during training when samples are enabled.
+  - Manually refresh at any time using the "Refresh sample gallery" button.
+  - Samples are saved to `output/<folder>/sample/` directory.
+  - Click any thumbnail to open the full-size image in a new tab.
 
 - **Logging**
   - For each training run, a timestamped log file is created under the selected output folder, e.g.:
     - `output/art/training_log_art_20251121_221124.log`
 
+- **RAM monitoring and protection**
+  - Automatically monitors RAM usage during training.
+  - If RAM usage exceeds 95%, training is automatically aborted to prevent system lockups.
+  - Caption models are automatically unloaded before training starts to free VRAM.
+
 - **Production‑style server**
   - Uses `waitress` WSGI server when available.
-  - Falls back to Flask’s development server only if `waitress` is not installed.
+  - Falls back to Flask's development server only if `waitress` is not installed.
 
 ---
 
@@ -160,7 +181,7 @@ At the top of the page:
   - `Text Encoder` (`qwen_2.5_vl_7b.safetensors`)
   - `VAE Model` (`diffusion_pytorch_model.safetensors`)
 
-These are saved in the current working directory and used by Musubi Tuner’s training scripts.
+These are saved in the current working directory and used by Musubi Tuner's training scripts.
 
 #### Step 2 – Upload training images
 
@@ -297,19 +318,42 @@ In **2. Training settings**:
   The **Final LoRA file** path is shown dynamically below the filename field and updates as you type.
 
 - **Advanced trainer flags & command preview (optional)**  
-  At the bottom of the training settings there is an **“Show advanced trainer flags”** button:
+  At the bottom of the training settings there is an **"Show advanced trainer flags"** button:
 
   - When you expand it, you get:
     - A multiline textbox for **advanced trainer flags**.
-    - A read‑only **“Effective training command (preview)”**.
+    - A read‑only **"Effective training command (preview)"**.
   - By default, the textbox is pre‑filled with sensible VRAM‑related flags based on your selected VRAM profile  
-    (e.g. `--fp8_base --fp8_scaled --blocks_to_swap ... --gradient_checkpointing`).
+    (e.g. `--fp8_base --fp8_scaled --blocks_to_swap ... --gradient_checkpointing --max_grad_norm 1.0`).
+  - `--max_grad_norm 1.0` is automatically added to prevent gradient explosion and numerical instability.
   - You can edit this textbox directly if you know what you are doing; whatever you write there is appended to the
     `python qwen_image_train_network.py` command shown in the preview.
   - This makes it easy for power users to:
     - tweak or remove VRAM flags
     - add extra options (dropout, gradient clipping, etc.)
     - while always seeing exactly what command MusubiTLX will run when you click **Start training**.
+
+- **Sample generation settings (optional)**
+  - **Generate sample previews during training**: Enable this checkbox to generate sample images during training.
+  - **Sample prompts**: Enter one prompt per line. Each line generates one sample image.
+    - You can use your trigger word with `{{trigger}}` syntax (e.g., `A portrait of {{trigger}}`).
+    - Optional parameters per prompt:
+      - `--w <width>`: Image width (default: 256 if not specified)
+      - `--h <height>`: Image height (default: 256 if not specified)
+      - `--s <steps>`: Number of inference steps (default: 20)
+      - `--d <seed>`: Random seed (default: uses training seed if not specified)
+      - `--f <frames>`: Number of frames for video (keep at 1 for still images)
+    - Lines starting with `#` are treated as comments and ignored.
+    - Example:
+      ```
+      A studio portrait of {{trigger}} --w 960 --h 960 --s 30
+      {{trigger}} in a fantasy landscape --w 1024 --h 768
+      ```
+  - **Sample every N epochs**: How often to generate samples (default: 1, generates after each epoch).
+  - **Sample every N steps**: Alternative to epochs-based sampling (default: 0, disabled).
+  - **Generate baseline samples before training starts**: Enable this to generate samples with the untrained model, allowing you to compare before/after results.
+  - **Refresh sample gallery**: Manual button to refresh the sample gallery at any time.
+  - **Auto-refresh**: The sample gallery automatically checks for new samples every 30 seconds during training when samples are enabled.
 
 #### Step 4 – Check estimated training time and system resources
 
@@ -332,24 +376,34 @@ In **2. Training settings**:
 #### Step 5 – Start training
 
 - Click **Start training**.
-- The spinner and message “Training in progress... Please wait.” appear.
+- The spinner and message "Training in progress... Please wait." appear.
 - The **Training log** area starts to fill with:
   - latent cache output
   - text encoder cache output
   - training progress (`steps: ...`, loss values, etc.)
 
+**During training**:
+- If sample generation is enabled, the sample gallery will automatically refresh every 30 seconds to show newly generated samples.
+- The system monitors RAM usage and will automatically abort training if RAM exceeds 95% to prevent system lockups.
+
+**Log stream management**:
+- If the browser tab goes to sleep or you reload the page during training, click **"Resume log stream"** to reconnect and view the latest log content.
+- The log stream will automatically resume if training is still active.
+
 At the end:
 
-- On success you’ll see:
+- On success you'll see:
 
   - `TRAINING COMPLETED!`
   - Path to the final LoRA file.
   - Path to the log file.
+  - If samples were enabled, the sample gallery will show all generated samples.
 
-- On error you’ll see:
+- On error you'll see:
 
   - `TRAINING ABORTED WITH ERROR (exit code X)`  
   - A note to check the log file for details.
+  - If the error was due to high RAM usage (>95%), a specific message will be shown.
 
 ---
 
@@ -369,6 +423,10 @@ You will typically see something like:
 - `output/art/*_qi_te.safetensors` – text encoder cache files
 - `output/art/art.safetensors` – **final trained LoRA**
 - `output/art/training_log_art_YYYYMMDD_HHMMSS.log` – log for that training run
+- `output/art/sample_prompts.txt` – sample prompts file (if samples are enabled)
+- `output/art/sample/` – directory containing generated sample images (if samples are enabled)
+  - Sample images are PNG files named with timestamps
+  - Baseline samples (if enabled) are generated before training starts
 
 ---
 
@@ -399,11 +457,33 @@ You will typically see something like:
 ### 7. Additional Features
 
 - **Caption model unloading**: Before training starts, caption models (ViT-GPT2, BLIP, Qwen-VL) are automatically unloaded from VRAM to free up memory for training.
+
+- **RAM monitoring and protection**: 
+  - System RAM usage is monitored during training.
+  - If RAM exceeds 95%, training is automatically aborted to prevent system lockups.
+  - Caption models are unloaded before training to reduce memory pressure.
+
 - **Training compatibility**: Training settings are optimized for compatibility with various inference settings in ComfyUI and other inference tools.
+
+- **Sample generation**: 
+  - Generate preview images during training to monitor progress.
+  - Customize sample prompts with optional resolution, steps, and seed parameters.
+  - View samples as clickable thumbnails in the GUI.
+  - Auto-refresh every 30 seconds during training.
+  - Generate baseline samples before training for comparison.
+
+- **Log stream resilience**: 
+  - If the browser tab goes to sleep or you reload the page, you can resume the log stream.
+  - The system automatically fetches the latest log content when reconnecting.
+
 - **Warning system**: 
   - Warning appears if you have too few images (< 8) with recommendations to improve training results.
   - Info buttons provide helpful tooltips for complex settings (learning rate, LoRA rank/dims).
+
 - **Individual image management**: Remove individual images from the preview without clearing all images.
+
+- **Gradient clipping**: 
+  - `--max_grad_norm 1.0` is automatically added to default training flags to prevent gradient explosion and numerical instability (`avr_loss=nan` issues).
 
 ### 8. Credits
 

@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, request, send_file, Response, stream_with_context, jsonify
-import subprocess, os, yaml, urllib.request, urllib.parse, shlex, mimetypes
+import subprocess, os, yaml, urllib.request, urllib.parse, shlex, mimetypes, sys, platform
 from werkzeug.utils import secure_filename
 import toml
 import threading
@@ -284,7 +284,6 @@ DOWNLOADS = {
 }
 
 def download_with_progress(url, fname):
-    import sys
     def reporthook(blocknum, blocksize, totalsize):
         readsofar = blocknum * blocksize
         if totalsize > 0:
@@ -366,6 +365,21 @@ HTML = r'''
     .sample-card img, .sample-card video { width:100%; border-radius:8px; object-fit:cover; max-height:150px; background:#0f1012; }
     .sample-card-meta { font-size:0.85em; color:#bbb; margin-top:6px; word-break:break-word; }
     .sample-gallery-empty { border:1px dashed #444; border-radius:10px; padding:14px; color:#777; font-size:0.95em; display:flex; justify-content:center; align-items:center; min-height:80px; width:100%; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-top: 12px; }
+    .field-group { display: flex; flex-direction: column; }
+    .field-group-half { grid-column: span 1; }
+    .field-group-wide { grid-column: span 2; }
+    .field-group button { width: auto; align-self: flex-start; }
+    .button-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 20px; }
+    .sample-section { grid-column: span 2; }
+    #sample-options { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+    #sample-options > .field-group-half { grid-column: span 1; width: 100%; }
+    @media (max-width: 768px) {
+      .form-grid { grid-template-columns: 1fr; }
+      .field-group-half, .field-group-wide, .sample-section { grid-column: span 1; }
+      #sample-options { grid-template-columns: 1fr; }
+      #sample-options > .field-group-half { grid-column: span 1; }
+    }
   </style>
 </head>
 <body>
@@ -560,7 +574,7 @@ HTML = r'''
             <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 4px;">Final LoRA file: <code id="final-path-preview">output/{% if user_output_dir %}{{user_output_dir}}/{% endif %}{{output_name}}.safetensors</code></small>
           </div>
           <div class="field-group field-group-wide">
-            <button type="button" id="advanced-toggle" onclick="toggleAdvancedFlags()">
+            <button type="button" id="advanced-toggle">
               Show advanced trainer flags
             </button>
             <div id="advanced-flags-panel" style="display:none; margin-top:10px;">
@@ -576,10 +590,10 @@ HTML = r'''
               </small>
             </div>
           </div>
-        <div class="sample-section">
+          <div class="sample-section">
           <div class="sample-toggle-row">
             <label class="info-icon-wrapper" style="margin:0; gap:10px;">
-              <input type="checkbox" id="samples_enabled" name="samples_enabled" {% if samples_enabled %}checked{% endif %} onchange="toggleSampleOptions(); updateCommandPreview();">
+              <input type="checkbox" id="samples_enabled" name="samples_enabled" {% if samples_enabled %}checked{% endif %}>
               <span style="font-weight:600;">Generate sample previews during training</span>
               <span class="info-icon">
                 ?
@@ -1320,19 +1334,6 @@ HTML = r'''
       markSampleGalleryPending("Output folder changed. Click refresh to load samples.");
     }
 
-    // Functions are already defined globally above, but keep these for backwards compatibility
-    function toggleAdvancedFlags() {
-      if (window.toggleAdvancedFlags) {
-        window.toggleAdvancedFlags();
-      }
-    }
-
-    function toggleSampleOptions() {
-      if (window.toggleSampleOptions) {
-        window.toggleSampleOptions();
-      }
-    }
-
     function setSampleGalleryStatus(message, isError) {
       const statusEl = document.getElementById('sample-gallery-status');
       if (!statusEl) return;
@@ -1874,6 +1875,14 @@ HTML = r'''
           startTraining();
         }
         setupDropzone();
+        const advancedToggleBtn = document.getElementById('advanced-toggle');
+        if (advancedToggleBtn) {
+          advancedToggleBtn.addEventListener('click', () => {
+            if (window.toggleAdvancedFlags) {
+              window.toggleAdvancedFlags();
+            }
+          });
+        }
         // Attach listeners to keep command preview in sync with form values
         const names = [
           "epochs","batch_size","image_repeats","lr","resolution",
@@ -1910,14 +1919,21 @@ HTML = r'''
         }
         const samplesCheckbox = document.getElementById('samples_enabled');
         if (samplesCheckbox) {
-          samplesCheckbox.addEventListener('change', updateCommandPreview);
+          samplesCheckbox.addEventListener('change', () => {
+            if (window.toggleSampleOptions) {
+              window.toggleSampleOptions();
+            }
+            updateCommandPreview();
+          });
         }
         const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
         if (sampleAtFirstCheckbox) {
           sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
         }
         syncAdvancedFlagsFromGui(true);
-        toggleSampleOptions();
+        if (window.toggleSampleOptions) {
+          window.toggleSampleOptions();
+        }
         updateCommandPreview();
         updateCaptionLengthLabel();
         updateDetailLevelLabel();
@@ -2119,7 +2135,7 @@ def write_dataset_config_toml(folder, batch_size, resolution, num_repeats):
 
 def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=None):
     cmd = [
-        "python", "src/musubi_tuner/qwen_image_cache_latents.py",
+        sys.executable, "src/musubi_tuner/qwen_image_cache_latents.py",
         "--dataset_config", dataset_config,
         "--vae", vae_model
     ]
@@ -2128,7 +2144,6 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
                                 text=True, bufsize=0, universal_newlines=True)
         register_process(proc)
         output = ""
-        import sys
         try:
             for line in iter(proc.stdout.readline, ''):
                 if line:
@@ -2145,8 +2160,15 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
             # Check if process crashed or was killed
             if proc.returncode != 0:
                 # SIGTERM (-15) means the process was cancelled gracefully - don't raise exception
-                import signal
-                if proc.returncode == -signal.SIGTERM or proc.returncode == -15:
+                # On Windows, signal module may not have SIGTERM, so check for -15 directly
+                try:
+                    import signal
+                    is_sigterm = proc.returncode == -signal.SIGTERM or proc.returncode == -15
+                except (AttributeError, ImportError):
+                    # Windows doesn't have SIGTERM in signal module, just check for -15
+                    is_sigterm = proc.returncode == -15
+                
+                if is_sigterm:
                     # Process was cancelled by user - this is expected behavior
                     output_queue.put("\n⚠️ Cache latents was cancelled\n")
                     if log_file:
@@ -2196,7 +2218,7 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
 
 def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile, stream_output=False, log_file=None):
     cmd = [
-        "python", "src/musubi_tuner/qwen_image_cache_text_encoder_outputs.py",
+        sys.executable, "src/musubi_tuner/qwen_image_cache_text_encoder_outputs.py",
         "--dataset_config", dataset_config,
         "--text_encoder", text_encoder,
         "--batch_size", str(batch_size)
@@ -2209,7 +2231,6 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
                                 text=True, bufsize=0, universal_newlines=True)
         register_process(proc)
         output = ""
-        import sys
         try:
             for line in iter(proc.stdout.readline, ''):
                 if line:
@@ -2226,8 +2247,15 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
             # Check if process crashed or was killed
             if proc.returncode != 0:
                 # SIGTERM (-15) means the process was cancelled gracefully - don't raise exception
-                import signal
-                if proc.returncode == -signal.SIGTERM or proc.returncode == -15:
+                # On Windows, signal module may not have SIGTERM, so check for -15 directly
+                try:
+                    import signal
+                    is_sigterm = proc.returncode == -signal.SIGTERM or proc.returncode == -15
+                except (AttributeError, ImportError):
+                    # Windows doesn't have SIGTERM in signal module, just check for -15
+                    is_sigterm = proc.returncode == -15
+                
+                if is_sigterm:
                     # Process was cancelled by user - this is expected behavior
                     output_queue.put("\n⚠️ Cache text encoder was cancelled\n")
                     if log_file:
@@ -2524,7 +2552,6 @@ def force_unload_ram():
         unload_caption_models()
         import gc
         import subprocess
-        import sys
         
         # Aggressive Python-level cleanup
         # Run multiple GC passes to ensure cleanup
@@ -2550,22 +2577,25 @@ def force_unload_ram():
         
         # Try to trigger OS-level cache cleanup (Linux only, requires appropriate permissions)
         # This can help free RAM cached by other processes like ComfyUI
+        # Windows doesn't have this capability, so this only works on Linux/Unix
         cache_freed = False
-        try:
-            # Try to drop page cache, dentries, and inodes (requires root or appropriate capabilities)
-            # echo 3 > /proc/sys/vm/drop_caches clears page cache, dentries, and inodes
-            # This is safe but requires elevated permissions
-            result = subprocess.run(
-                ['sh', '-c', 'sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null'],
-                capture_output=True,
-                timeout=5,
-                check=False  # Don't fail if we can't do this
-            )
-            if result.returncode == 0:
-                cache_freed = True
-        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, Exception):
-            # If we can't drop caches (no permissions, not Linux, etc.), that's okay
-            pass
+        import platform
+        if platform.system() == 'Linux':
+            try:
+                # Try to drop page cache, dentries, and inodes (requires root or appropriate capabilities)
+                # echo 3 > /proc/sys/vm/drop_caches clears page cache, dentries, and inodes
+                # This is safe but requires elevated permissions
+                result = subprocess.run(
+                    ['sh', '-c', 'sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null'],
+                    capture_output=True,
+                    timeout=5,
+                    check=False  # Don't fail if we can't do this
+                )
+                if result.returncode == 0:
+                    cache_freed = True
+            except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, Exception):
+                # If we can't drop caches (no permissions, not Linux, etc.), that's okay
+                pass
         
         message = "RAM unloaded. Caption models removed and aggressive garbage collection run."
         if cache_freed:
@@ -3111,7 +3141,7 @@ def gui():
                                 # 3. Train LoRA
                                 output_queue.put("[Training]\n")
                                 cmd = [
-                                    "python", "src/musubi_tuner/qwen_image_train_network.py",
+                                    sys.executable, "src/musubi_tuner/qwen_image_train_network.py",
                                     "--dit", dit_model,
                                     "--vae", vae_model,
                                     "--text_encoder", text_encoder,
@@ -3192,7 +3222,6 @@ def gui():
                                             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                                    text=True, env=env, bufsize=0, universal_newlines=True)
                                             register_process(proc)
-                                            import sys
                                             
                                             # RAM monitoring: check every 10 seconds
                                             last_ram_check_time = time.time()

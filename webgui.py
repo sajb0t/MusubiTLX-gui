@@ -1,13 +1,39 @@
-from flask import Flask, render_template_string, request, send_file, Response, stream_with_context, jsonify
+from flask import Flask, render_template_string, request, send_file, Response, stream_with_context, jsonify, make_response
 import subprocess, os, yaml, urllib.request, urllib.parse, shlex, mimetypes, sys, platform
 from werkzeug.utils import secure_filename
 import toml
 import threading
 import queue
 import time
+import signal
+import gzip
+import io
 from datetime import datetime
 
 app = Flask(__name__)
+
+# Add gzip compression to reduce response size (helps with network timeouts)
+@app.after_request
+def compress_response(response):
+    # Compress HTML and JSON responses that are large enough to benefit
+    if (response.status_code == 200 and 
+        response.content_type and 
+        ('text/html' in response.content_type or 'application/json' in response.content_type) and
+        len(response.get_data()) > 500):
+        
+        accept_encoding = request.headers.get('Accept-Encoding', '')
+        if 'gzip' in accept_encoding.lower():
+            # Compress the response
+            gzip_buffer = io.BytesIO()
+            with gzip.GzipFile(mode='wb', fileobj=gzip_buffer, compresslevel=6) as gzip_file:
+                gzip_file.write(response.get_data())
+            
+            response.set_data(gzip_buffer.getvalue())
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Length'] = len(response.get_data())
+            response.headers['Vary'] = 'Accept-Encoding'
+    
+    return response
 app.config["UPLOAD_FOLDER"] = "uploads"
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
@@ -402,16 +428,16 @@ HTML = r'''
         <label>Select images (multiple allowed)</label>
         <div class="file-input-wrapper">
           <label for="images" class="file-input-label">Choose images</label>
-          <button type="button" class="file-input-clear-btn" id="clear-images-btn" onclick="clearSelectedImages()" style="display:none;">Clear all</button>
+          <button type="button" class="file-input-clear-btn" id="clear-images-btn" onclick="window.clearSelectedImages && window.clearSelectedImages()" style="display:none;">Clear all</button>
           <span class="file-input-text" id="file-input-status">No files selected</span>
-          <input type="file" id="images" name="images" multiple accept="image/*" onchange="previewImages(event)">
+          <input type="file" id="images" name="images" multiple accept="image/*" onchange="window.previewImages && window.previewImages(event)">
         </div>
         <div class="imglist imglist-empty" id="preview">
           <div class="drop-hint">
             Drag &amp; drop images here or use the file picker above.
           </div>
         </div>
-      <button type="button" id="autocap-btn" onclick="autoCaptionCaptionModel()">
+      <button type="button" id="autocap-btn" onclick="window.autoCaptionCaptionModel && window.autoCaptionCaptionModel()">
         Auto-caption images
       </button>
       <small style="color:#888; display:block; margin-top:4px;">
@@ -428,14 +454,14 @@ HTML = r'''
       <label style="margin-top:8px;">
         Caption length
       </label>
-      <input type="range" id="caption_max_length" name="caption_max_length" min="32" max="192" step="8" value="128" oninput="updateCaptionLengthLabel()">
+      <input type="range" id="caption_max_length" name="caption_max_length" min="32" max="192" step="8" value="128" oninput="window.updateCaptionLengthLabel && window.updateCaptionLengthLabel()">
       <div style="font-size:0.85em; color:#aaa; margin-top:2px;">
         Target length: <span id="caption_length_label">128</span> tokens (approximate, longer = more detail)
       </div>
       <label style="margin-top:12px;">
         Detail level (BLIP only)
       </label>
-      <input type="range" id="caption_detail_level" name="caption_detail_level" min="1" max="5" step="1" value="3" oninput="updateDetailLevelLabel()">
+      <input type="range" id="caption_detail_level" name="caption_detail_level" min="1" max="5" step="1" value="3" oninput="window.updateDetailLevelLabel && window.updateDetailLevelLabel()">
       <div style="font-size:0.85em; color:#aaa; margin-top:2px;">
         Level: <span id="detail_level_label">3</span> / 5 (<span id="detail_level_desc">Detailed</span>)
       </div>
@@ -454,7 +480,7 @@ HTML = r'''
           </div>
           <div class="field-group field-group-half">
             <label>Your GPU VRAM (select your graphics card's VRAM)</label>
-            <select name="vram_profile" onchange="updateEstimate(); syncAdvancedFlagsFromGui(false);">
+            <select name="vram_profile" onchange="window.updateEstimate && window.updateEstimate(); window.syncAdvancedFlagsFromGui && window.syncAdvancedFlagsFromGui(false);">
               <option value="12" {% if vram_profile == '12' %}selected{% endif %}>I have 12GB VRAM – uses ~12GB VRAM, offloads most to RAM (64GB+ RAM recommended, slowest but safest)</option>
               <option value="16" {% if vram_profile == '16' %}selected{% endif %}>I have 16GB VRAM – uses ~16-18GB VRAM, offloads some to RAM (64GB+ RAM recommended, balanced)</option>
               <option value="24" {% if vram_profile == '24' %}selected{% endif %}>I have 24GB+ VRAM – uses ~24GB VRAM, offloads minimal to RAM (64GB+ RAM recommended, fastest)</option>
@@ -466,15 +492,15 @@ HTML = r'''
           </div>
           <div class="field-group field-group-half">
             <label>Epochs (how many passes over the dataset)</label>
-            <input name="epochs" type="number" value="{{epochs}}" oninput="updateEstimate()">
+            <input name="epochs" type="number" value="{{epochs}}" oninput="window.updateEstimate && window.updateEstimate()">
           </div>
           <div class="field-group field-group-half">
             <label>Batch size</label>
-            <input name="batch_size" type="number" value="{{batch_size}}" oninput="updateEstimate()">
+            <input name="batch_size" type="number" value="{{batch_size}}" oninput="window.updateEstimate && window.updateEstimate()">
           </div>
           <div class="field-group field-group-half">
             <label>Image repeats (how many times each image is seen)</label>
-            <input name="image_repeats" type="number" value="{{image_repeats}}" oninput="updateEstimate()">
+            <input name="image_repeats" type="number" value="{{image_repeats}}" oninput="window.updateEstimate && window.updateEstimate()">
           </div>
           <div class="field-group field-group-half">
             <label class="info-icon-wrapper">
@@ -513,7 +539,7 @@ HTML = r'''
           </div>
           <div class="field-group field-group-half">
             <label>Resolution (e.g. 1024x1024)</label>
-            <input name="resolution" type="text" value="{{resolution}}" oninput="updateEstimate()">
+            <input name="resolution" type="text" value="{{resolution}}" oninput="window.updateEstimate && window.updateEstimate()">
           </div>
           <div class="field-group field-group-half">
             <label>Seed (same seed = repeatable result)</label>
@@ -565,12 +591,12 @@ HTML = r'''
           </div>
           <div class="field-group field-group-wide">
             <label>Output folder (under <code>output/</code>)</label>
-            <input name="output_dir" type="text" value="{{user_output_dir}}" placeholder="empty = use 'output'" oninput="updateFinalPath()">
+            <input name="output_dir" type="text" value="{{user_output_dir}}" placeholder="empty = use 'output'" oninput="window.updateFinalPath && window.updateFinalPath()">
             <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 6px;">If you enter <code>art</code> files will be saved in <code>output/art/</code></small>
           </div>
           <div class="field-group field-group-wide">
             <label>LoRA filename (.safetensors)</label>
-            <input name="output_name" type="text" value="{{output_name}}" placeholder="lora" required oninput="updateFinalPath()">
+            <input name="output_name" type="text" value="{{output_name}}" placeholder="lora" required oninput="window.updateFinalPath && window.updateFinalPath()">
             <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 4px;">Final LoRA file: <code id="final-path-preview">output/{% if user_output_dir %}{{user_output_dir}}/{% endif %}{{output_name}}.safetensors</code></small>
           </div>
           <div class="field-group field-group-wide">
@@ -593,7 +619,7 @@ HTML = r'''
           <div class="sample-section">
           <div class="sample-toggle-row">
             <label class="info-icon-wrapper" style="margin:0; gap:10px;">
-              <input type="checkbox" id="samples_enabled" name="samples_enabled" {% if samples_enabled %}checked{% endif %}>
+              <input type="checkbox" id="samples_enabled" name="samples_enabled" {% if samples_enabled %}checked{% endif %} onchange="window.toggleSampleOptions && window.toggleSampleOptions(); window.updateCommandPreview && window.updateCommandPreview();">
               <span style="font-weight:600;">Generate sample previews during training</span>
               <span class="info-icon">
                 ?
@@ -621,17 +647,17 @@ HTML = r'''
             </small>
             <div class="field-group field-group-half" style="margin-top:10px;">
               <label>Sample every N epochs (0 = disable)</label>
-              <input name="sample_every_epochs" type="number" min="0" value="{% if sample_every_epochs is defined %}{{sample_every_epochs}}{% else %}1{% endif %}" placeholder="1" oninput="updateCommandPreview()">
+              <input name="sample_every_epochs" type="number" min="0" value="{% if sample_every_epochs is defined %}{{sample_every_epochs}}{% else %}1{% endif %}" placeholder="1" oninput="window.updateCommandPreview && window.updateCommandPreview()">
               <small style="color:#888; display:block; margin-top:2px;">Default: 1 (sample after each epoch)</small>
             </div>
             <div class="field-group field-group-half" style="margin-top:10px;">
               <label>Sample every N steps (0 = disable)</label>
-              <input name="sample_every_steps" type="number" min="0" value="{% if sample_every_steps is defined %}{{sample_every_steps}}{% else %}0{% endif %}" placeholder="0" oninput="updateCommandPreview()">
+              <input name="sample_every_steps" type="number" min="0" value="{% if sample_every_steps is defined %}{{sample_every_steps}}{% else %}0{% endif %}" placeholder="0" oninput="window.updateCommandPreview && window.updateCommandPreview()">
               <small style="color:#888; display:block; margin-top:2px;">Default: 0 (use epochs instead)</small>
             </div>
             <div class="sample-toggle-row" style="margin-top:10px;">
               <label class="info-icon-wrapper" style="margin:0; gap:10px;">
-                <input type="checkbox" id="sample_at_first" name="sample_at_first" {% if sample_at_first %}checked{% endif %} onchange="updateCommandPreview()">
+                <input type="checkbox" id="sample_at_first" name="sample_at_first" {% if sample_at_first %}checked{% endif %} onchange="window.updateCommandPreview && window.updateCommandPreview()">
                 <span style="font-weight:600;">Generate baseline samples before training starts</span>
                 <span class="info-icon">
                   ?
@@ -645,7 +671,7 @@ HTML = r'''
               </label>
             </div>
             <div style="margin-top:18px;">
-              <button type="button" onclick="refreshSampleGallery()" style="background:#7a5cff;">Refresh sample gallery</button>
+              <button type="button" onclick="window.refreshSampleGallery && window.refreshSampleGallery()" style="background:#7a5cff;">Refresh sample gallery</button>
               <small style="color:#888; display:block; margin-top:4px;">
                 Uses the current output folder (shown above). Samples save to <code>{{output_dir if output_dir else 'output'}}/sample/</code>.
               </small>
@@ -673,8 +699,8 @@ HTML = r'''
           </ul>
         </div>
         <div class="button-row">
-          <button type="button" id="start-btn" onclick="startTraining()">Start training</button>
-          <button type="button" id="cancel-btn" onclick="cancelTraining()">Cancel training</button>
+          <button type="button" id="start-btn" onclick="window.startTraining && window.startTraining()">Start training</button>
+          <button type="button" id="cancel-btn" onclick="window.cancelTraining && window.cancelTraining()">Cancel training</button>
           <button type="submit" id="saveyaml-btn" name="action" value="saveyaml">Save configuration as YAML</button>
           <button type="submit" id="loadyaml-btn" name="action" value="loadyaml">Load last YAML config</button>
         </div>
@@ -717,7 +743,7 @@ HTML = r'''
           <div style="flex: 1; min-width: 200px; display: flex; align-items: center;">
             <strong style="color: #86c6fe; font-size: 0.95em;">RAM:</strong>
             <span id="ram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
-            <span class="unload-icon" id="force-unload-ram-icon" onclick="forceUnloadRAM()" title="Click to unload RAM">
+            <span class="unload-icon" id="force-unload-ram-icon" onclick="window.forceUnloadRAM && window.forceUnloadRAM()" title="Click to unload RAM">
               🗑️
               <span class="info-tooltip" style="width: 320px;">
                 <strong>Force Unload RAM</strong>
@@ -730,7 +756,7 @@ HTML = r'''
           <div style="flex: 1; min-width: 200px; display: flex; align-items: center;">
             <strong style="color: #86c6fe; font-size: 0.95em;">VRAM:</strong>
             <span id="vram-info" style="color: #ddd; font-size: 0.9em; margin-left: 8px;">Loading...</span>
-            <span class="unload-icon" id="force-unload-vram-icon" onclick="forceUnloadVRAM()" title="Click to unload VRAM">
+            <span class="unload-icon" id="force-unload-vram-icon" onclick="window.forceUnloadVRAM && window.forceUnloadVRAM()" title="Click to unload VRAM">
               🗑️
               <span class="info-tooltip" style="width: 320px;">
                 <strong>Force Unload VRAM</strong>
@@ -749,7 +775,7 @@ HTML = r'''
         <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
           <strong>Training log:</strong>
           <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <button type="button" onclick="resumeLogStream()">Resume log stream</button>
+            <button type="button" onclick="window.resumeLogStream && window.resumeLogStream()">Resume log stream</button>
             <small id="log-resume-status" style="color:#8ea2be; display:none;"></small>
           </div>
         </div>
@@ -896,7 +922,10 @@ HTML = r'''
     // Update system resources (RAM/VRAM) display
     async function updateSystemResources() {
       try {
-        const response = await fetch('/system_resources');
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        const response = await fetch('/system_resources', { signal: controller.signal });
+        clearTimeout(timeoutId);
         if (!response.ok) {
           throw new Error('HTTP ' + response.status);
         }
@@ -933,14 +962,17 @@ HTML = r'''
           }
         }
       } catch (err) {
-        console.error('Failed to fetch system resources:', err);
+        // Silently fail for AbortError (timeout), log others
+        if (err.name !== 'AbortError') {
+          console.error('Failed to fetch system resources:', err);
+        }
         const ramInfo = document.getElementById('ram-info');
         const vramInfo = document.getElementById('vram-info');
-        if (ramInfo) {
+        if (ramInfo && ramInfo.textContent === 'Loading...') {
           ramInfo.textContent = 'Error loading';
           ramInfo.style.color = '#ff6666';
         }
-        if (vramInfo) {
+        if (vramInfo && vramInfo.textContent === 'Loading...') {
           vramInfo.textContent = 'Error loading';
           vramInfo.style.color = '#ff6666';
         }
@@ -1200,7 +1232,7 @@ HTML = r'''
             var div = document.createElement('div');
             div.className = "imgbox";
             div.setAttribute('data-file-index', i);
-            div.innerHTML = '<button type="button" class="imgbox-remove" onclick="removeImage(' + i + ')" title="Remove this image">×</button>' +
+            div.innerHTML = '<button type="button" class="imgbox-remove" onclick="window.removeImage && window.removeImage(' + i + ')" title="Remove this image">×</button>' +
                 '<img><br>' +
                 '<textarea class="caption-textarea" name="caption_' + i + '" rows="2" placeholder="Caption for image ' + (i + 1) + '"></textarea>';
             let imgEl = div.querySelector('img');
@@ -1859,100 +1891,241 @@ HTML = r'''
       }
     }
     
-    // Auto-start streaming when page loads with training in progress
-    window.addEventListener('load', function() {
-      // Start system resources monitoring immediately (non-blocking)
-      try {
-        updateSystemResources();
-        setInterval(updateSystemResources, 3000);
-      } catch (err) {
-        console.error('Failed to initialize system resources monitoring:', err);
-      }
+    // Make ALL functions available globally for inline handlers - MUST be after all function definitions
+    window.clearSelectedImages = clearSelectedImages;
+    window.previewImages = previewImages;
+    window.removeImage = removeImage;
+    window.autoCaptionCaptionModel = autoCaptionCaptionModel;
+    window.updateCaptionLengthLabel = updateCaptionLengthLabel;
+    window.updateDetailLevelLabel = updateDetailLevelLabel;
+    window.updateFinalPath = updateFinalPath;
+    window.updateEstimate = updateEstimate;
+    window.updateCommandPreview = updateCommandPreview;
+    window.syncAdvancedFlagsFromGui = syncAdvancedFlagsFromGui;
+    window.refreshSampleGallery = refreshSampleGallery;
+    window.startTraining = startTraining;
+    window.cancelTraining = cancelTraining;
+    window.resumeLogStream = resumeLogStream;
+    window.setSampleGalleryStatus = setSampleGalleryStatus;
+    window.renderSampleGallery = renderSampleGallery;
+    window.computeFinalOutputDir = computeFinalOutputDir;
+    window.markSampleGalleryPending = markSampleGalleryPending;
+    
+    // Initialize page when DOM is ready
+    let initDone = false;
+    window.initializePage = function initializePage() {
+      if (initDone) return;
+      initDone = true;
+      
+      // Start system resources monitoring with delay to avoid blocking
+      setTimeout(function() {
+        try {
+          if (typeof updateSystemResources === 'function') {
+            updateSystemResources();
+            setInterval(updateSystemResources, 3000);
+          }
+        } catch (err) {
+          console.error('Failed to initialize system resources monitoring:', err);
+        }
+      }, 100);
       
       try {
-        const spinner = document.getElementById("spinner");
-        if (spinner && spinner.style.display === "block") {
-          startTraining();
+        // Safely check for spinner and start training if needed
+        try {
+          const spinner = document.getElementById("spinner");
+          if (spinner && spinner.style.display === "block" && typeof startTraining === 'function') {
+            startTraining();
+          }
+        } catch (err) {
+          console.error('Error checking spinner:', err);
         }
-        setupDropzone();
+        
+        // Setup dropzone
+        try {
+          if (typeof setupDropzone === 'function') {
+            setupDropzone();
+          }
+        } catch (err) {
+          console.error('Error setting up dropzone:', err);
+        }
+        
+        // Setup advanced toggle button
         const advancedToggleBtn = document.getElementById('advanced-toggle');
         if (advancedToggleBtn) {
-          advancedToggleBtn.addEventListener('click', () => {
-            if (window.toggleAdvancedFlags) {
-              window.toggleAdvancedFlags();
-            }
-          });
+          advancedToggleBtn.onclick = function() {
+            window.toggleAdvancedFlags();
+          };
         }
-        // Attach listeners to keep command preview in sync with form values
-        const names = [
-          "epochs","batch_size","image_repeats","lr","resolution",
-          "seed","rank","dims","output_dir","output_name",
-          "sample_every_epochs","sample_every_steps"
-        ];
-        names.forEach(n => {
-          const el = document.querySelector('input[name="' + n + '"]');
-          if (el) {
-            el.addEventListener('input', updateCommandPreview);
-            el.addEventListener('change', updateCommandPreview);
-          }
-        });
-        const vramSel = document.querySelector('select[name="vram_profile"]');
-        if (vramSel) {
-          vramSel.addEventListener('change', function() {
-            syncAdvancedFlagsFromGui(false);
-          });
-        }
-        const optSel = document.querySelector('select[name="optimizer_type"]');
-        if (optSel) {
-          optSel.addEventListener('change', updateCommandPreview);
-        }
-        const advFlags = document.querySelector('textarea[name="advanced_flags"]');
-        if (advFlags) {
-          advFlags.addEventListener('input', function() {
-            advFlagsDirty = true;
-            updateCommandPreview();
-          });
-        }
-        const samplePromptTextarea = document.getElementById('sample_prompt_text');
-        if (samplePromptTextarea) {
-          samplePromptTextarea.addEventListener('input', updateCommandPreview);
-        }
-        const samplesCheckbox = document.getElementById('samples_enabled');
-        if (samplesCheckbox) {
-          samplesCheckbox.addEventListener('change', () => {
-            if (window.toggleSampleOptions) {
-              window.toggleSampleOptions();
-            }
-            updateCommandPreview();
-          });
-        }
-        const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
-        if (sampleAtFirstCheckbox) {
-          sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
-        }
-        syncAdvancedFlagsFromGui(true);
-        if (window.toggleSampleOptions) {
-          window.toggleSampleOptions();
-        }
-        updateCommandPreview();
-        updateCaptionLengthLabel();
-        updateDetailLevelLabel();
-        updateFinalPath();
         
-        // Load sample gallery (non-blocking, errors won't stop other functionality)
+        // Attach listeners to keep command preview in sync with form values
         try {
-          refreshSampleGallery(true);
+          const names = [
+            "epochs","batch_size","image_repeats","lr","resolution",
+            "seed","rank","dims","output_dir","output_name",
+            "sample_every_epochs","sample_every_steps"
+          ];
+          names.forEach(n => {
+            try {
+              const el = document.querySelector('input[name="' + n + '"]');
+              if (el && typeof updateCommandPreview === 'function') {
+                el.addEventListener('input', updateCommandPreview);
+                el.addEventListener('change', updateCommandPreview);
+              }
+            } catch (err) {
+              console.error('Error attaching listener to ' + n + ':', err);
+            }
+          });
         } catch (err) {
-          console.error('Failed to load sample gallery on page load:', err);
+          console.error('Error setting up form listeners:', err);
         }
+        
+        // Setup VRAM profile selector
         try {
-          refreshReadmeLink();
+          const vramSel = document.querySelector('select[name="vram_profile"]');
+          if (vramSel && typeof syncAdvancedFlagsFromGui === 'function') {
+            vramSel.addEventListener('change', function() {
+              syncAdvancedFlagsFromGui(false);
+            });
+          }
         } catch (err) {
-          console.error('Failed to refresh README link on load:', err);
+          console.error('Error setting up VRAM selector:', err);
         }
+        
+        // Setup optimizer selector
+        try {
+          const optSel = document.querySelector('select[name="optimizer_type"]');
+          if (optSel && typeof updateCommandPreview === 'function') {
+            optSel.addEventListener('change', updateCommandPreview);
+          }
+        } catch (err) {
+          console.error('Error setting up optimizer selector:', err);
+        }
+        
+        // Setup advanced flags textarea
+        try {
+          const advFlags = document.querySelector('textarea[name="advanced_flags"]');
+          if (advFlags && typeof updateCommandPreview === 'function') {
+            advFlags.addEventListener('input', function() {
+              advFlagsDirty = true;
+              updateCommandPreview();
+            });
+          }
+        } catch (err) {
+          console.error('Error setting up advanced flags:', err);
+        }
+        
+        // Setup sample prompt textarea
+        try {
+          const samplePromptTextarea = document.getElementById('sample_prompt_text');
+          if (samplePromptTextarea && typeof updateCommandPreview === 'function') {
+            samplePromptTextarea.addEventListener('input', updateCommandPreview);
+          }
+        } catch (err) {
+          console.error('Error setting up sample prompt textarea:', err);
+        }
+        
+        // Setup samples checkbox
+        try {
+          const samplesCheckbox = document.getElementById('samples_enabled');
+          if (samplesCheckbox) {
+            samplesCheckbox.addEventListener('change', () => {
+              if (window.toggleSampleOptions) {
+                window.toggleSampleOptions();
+              }
+              if (typeof updateCommandPreview === 'function') {
+                updateCommandPreview();
+              }
+            });
+          }
+        } catch (err) {
+          console.error('Error setting up samples checkbox:', err);
+        }
+        
+        // Setup sample at first checkbox
+        try {
+          const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
+          if (sampleAtFirstCheckbox && typeof updateCommandPreview === 'function') {
+            sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
+          }
+        } catch (err) {
+          console.error('Error setting up sample at first checkbox:', err);
+        }
+        
+        // Initialize form values - wrap each in try-catch
+        try {
+          if (typeof syncAdvancedFlagsFromGui === 'function') {
+            syncAdvancedFlagsFromGui(true);
+          }
+        } catch (err) {
+          console.error('Error syncing advanced flags:', err);
+        }
+        
+        try {
+          if (window.toggleSampleOptions) {
+            window.toggleSampleOptions();
+          }
+        } catch (err) {
+          console.error('Error toggling sample options:', err);
+        }
+        
+        try {
+          if (typeof updateCommandPreview === 'function') {
+            updateCommandPreview();
+          }
+        } catch (err) {
+          console.error('Error updating command preview:', err);
+        }
+        
+        try {
+          if (typeof updateCaptionLengthLabel === 'function') {
+            updateCaptionLengthLabel();
+          }
+        } catch (err) {
+          console.error('Error updating caption length label:', err);
+        }
+        
+        try {
+          if (typeof updateDetailLevelLabel === 'function') {
+            updateDetailLevelLabel();
+          }
+        } catch (err) {
+          console.error('Error updating detail level label:', err);
+        }
+        
+        try {
+          if (typeof updateFinalPath === 'function') {
+            updateFinalPath();
+          }
+        } catch (err) {
+          console.error('Error updating final path:', err);
+        }
+        
+        // Load sample gallery and README link with delay to avoid blocking
+        setTimeout(function() {
+          try {
+            if (typeof refreshSampleGallery === 'function') {
+              refreshSampleGallery(true);
+            }
+          } catch (err) {
+            console.error('Failed to load sample gallery on page load:', err);
+          }
+          try {
+            if (typeof refreshReadmeLink === 'function') {
+              refreshReadmeLink();
+            }
+          } catch (err) {
+            console.error('Failed to refresh README link on load:', err);
+          }
+        }, 200);
+        
       } catch (err) {
-        console.error('Error during page initialization:', err);
+        console.error('❌ Error during page initialization:', err);
       }
+    }
+    
+    // Run initialization when DOM is ready
+    document.addEventListener('DOMContentLoaded', function() {
+      window.initializePage();
     });
   </script>
 </body>
@@ -2140,8 +2313,11 @@ def run_cache_latents(dataset_config, vae_model, stream_output=False, log_file=N
         "--vae", vae_model
     ]
     if stream_output:
+        # Create subprocess in new session so it survives SSH disconnect
+        # start_new_session=True creates a new process group, preventing SIGHUP propagation
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=0, universal_newlines=True)
+                                text=True, bufsize=0, universal_newlines=True,
+                                start_new_session=True if platform.system() != 'Windows' else False)
         register_process(proc)
         output = ""
         try:
@@ -2227,8 +2403,11 @@ def run_cache_textencoder(dataset_config, text_encoder, batch_size, vram_profile
     if str(vram_profile) in ["12", "16"]:
         cmd.append("--fp8_vl")
     if stream_output:
+        # Create subprocess in new session so it survives SSH disconnect
+        # start_new_session=True creates a new process group, preventing SIGHUP propagation
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=0, universal_newlines=True)
+                                text=True, bufsize=0, universal_newlines=True,
+                                start_new_session=True if platform.system() != 'Windows' else False)
         register_process(proc)
         output = ""
         try:
@@ -3219,8 +3398,11 @@ def gui():
                                             log_file.write("="*60 + "\n\n")
                                             log_file.flush()
                                             
+                                            # Create subprocess in new session so it survives SSH disconnect
+                                            # start_new_session=True creates a new process group, preventing SIGHUP propagation
                                             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                                   text=True, env=env, bufsize=0, universal_newlines=True)
+                                                                   text=True, env=env, bufsize=0, universal_newlines=True,
+                                                                   start_new_session=True if platform.system() != 'Windows' else False)
                                             register_process(proc)
                                             
                                             # RAM monitoring: check every 10 seconds
@@ -3493,12 +3675,31 @@ def gui():
     )
 
 if __name__ == "__main__":
-    # Prefer a production-ready WSGI server (waitress) if available,
-    # but fall back to Flask's development server if not installed.
+    # Ignore SIGHUP signal to prevent the server from being killed when SSH disconnects
+    # This allows training to continue even if the SSH connection is lost
+    def ignore_sighup(signum, frame):
+        print("Received SIGHUP (SSH disconnect). Ignoring to keep server running...")
+        pass
+    
+    # Only set signal handler on Unix-like systems (Linux, macOS)
+    # Windows doesn't use SIGHUP in the same way
+    if hasattr(signal, 'SIGHUP'):
+        try:
+            signal.signal(signal.SIGHUP, ignore_sighup)
+            print("SIGHUP handler installed. Server will continue running if SSH disconnects.")
+        except (ValueError, OSError) as e:
+            print(f"Warning: Could not set SIGHUP handler: {e}")
+    
+    # Use Waitress WSGI server for production-quality serving
     try:
         from waitress import serve
         print("Starting MusubiTLX with waitress...")
-        serve(app, host="0.0.0.0", port=5000)
+        print("Note: To run in background, use: nohup ./start_gui.sh > webgui.log 2>&1 &")
+        print("Or use screen/tmux for better session management.")
+        # Use channel_timeout to prevent connection resets
+        serve(app, host="0.0.0.0", port=5000, threads=4, channel_timeout=120, recv_bytes=65536, send_bytes=65536)
     except ImportError:
         print("waitress is not installed, falling back to Flask development server.")
-        app.run(host="0.0.0.0", port=5000, debug=True)
+        print("Note: To run in background, use: nohup ./start_gui.sh > webgui.log 2>&1 &")
+        print("Or use screen/tmux for better session management.")
+        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

@@ -1725,7 +1725,7 @@ HTML = r'''
     let eventSource = null;
     let sseBuffer = "";
     let lastSseFlush = 0;
-    const SSE_FLUSH_INTERVAL_MS = 8000; // flush to UI at most ~every 8 seconds
+    const SSE_FLUSH_INTERVAL_MS = 1000; // flush to UI every 1 second for responsive updates
     
     // Auto-refresh sample gallery during training
     let sampleGalleryPollInterval = null;
@@ -1784,6 +1784,15 @@ HTML = r'''
           return;
         }
         
+        // Handle SSE reconnect signal (server closes connection periodically)
+        if (data.includes("[SSE_RECONNECT]")) {
+          // Silently reconnect without showing anything to user
+          setTimeout(function() {
+            openLogStream();
+          }, 500);
+          return;
+        }
+        
         if (data.includes("TRAINING ABORTED WITH ERROR") || data.includes("torch.OutOfMemoryError")) {
           document.getElementById("spinner").style.display = "none";
           stopSampleGalleryPolling();
@@ -1835,9 +1844,15 @@ HTML = r'''
       };
       
       eventSource.onerror = function(event) {
-        if (eventSource.readyState === EventSource.CLOSED) {
-        } else {
-             console.error("EventSource error:", event);
+        // Auto-reconnect on error (common with Waitress)
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+          const spinner = document.getElementById("spinner");
+          if (spinner && spinner.style.display === "block") {
+            // Training is active, try to reconnect
+            setTimeout(function() {
+              openLogStream();
+            }, 1000);
+          }
         }
       };
     }
@@ -1918,16 +1933,29 @@ HTML = r'''
       initDone = true;
       
       // Start system resources monitoring with delay to avoid blocking
+      // Pause polling during training to reduce server load
+      let resourcePollInterval = null;
+      function startResourcePolling() {
+        if (resourcePollInterval) return;
+        resourcePollInterval = setInterval(function() {
+          // Skip polling if training is active (spinner visible)
+          const spinner = document.getElementById("spinner");
+          if (spinner && spinner.style.display === "block") return;
+          if (typeof updateSystemResources === 'function') {
+            updateSystemResources();
+          }
+        }, 15000); // 15 seconds
+      }
       setTimeout(function() {
         try {
           if (typeof updateSystemResources === 'function') {
-            updateSystemResources();
-            setInterval(updateSystemResources, 3000);
+            updateSystemResources(); // Initial update
+            startResourcePolling();
           }
         } catch (err) {
           console.error('Failed to initialize system resources monitoring:', err);
         }
-      }, 100);
+      }, 500);
       
       try {
         // Safely check for spinner and start training if needed
@@ -3006,9 +3034,16 @@ def musubitlx_gui_readme():
 @app.route("/stream")
 def stream():
     def generate():
+        start_time = time.time()
+        max_connection_time = 120  # Close connection after 2 minutes (client will auto-reconnect)
         while True:
+            # Close connection periodically to prevent Waitress thread exhaustion
+            if time.time() - start_time > max_connection_time:
+                yield f"data: [SSE_RECONNECT]\n\n"
+                return
             try:
-                line = output_queue.get(timeout=1)
+                # Use shorter timeout for more responsive updates
+                line = output_queue.get(timeout=0.5)
                 if line:  # Only send non-empty lines
                     # Handle carriage returns (\r) - progress bars use \r to overwrite the same line
                     # Convert \r to \n so each progress update appears on a new line
@@ -3025,7 +3060,8 @@ def stream():
                         line = line + '\n'
                     yield f"data: {line}\n\n"
             except queue.Empty:
-                yield f"data: \n\n"  # Keep connection alive
+                # Send heartbeat to keep connection alive
+                yield f"data: \n\n"
     return Response(stream_with_context(generate()), mimetype="text/event-stream", headers={
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no'
@@ -3690,16 +3726,42 @@ if __name__ == "__main__":
         except (ValueError, OSError) as e:
             print(f"Warning: Could not set SIGHUP handler: {e}")
     
-    # Use Waitress WSGI server for production-quality serving
-    try:
-        from waitress import serve
-        print("Starting MusubiTLX with waitress...")
-        print("Note: To run in background, use: nohup ./start_gui.sh > webgui.log 2>&1 &")
-        print("Or use screen/tmux for better session management.")
-        # Use channel_timeout to prevent connection resets
-        serve(app, host="0.0.0.0", port=5000, threads=4, channel_timeout=120, recv_bytes=65536, send_bytes=65536)
-    except ImportError:
-        print("waitress is not installed, falling back to Flask development server.")
-        print("Note: To run in background, use: nohup ./start_gui.sh > webgui.log 2>&1 &")
-        print("Or use screen/tmux for better session management.")
+    # Server selection for production use with SSE (Server-Sent Events) support
+    # Priority: gevent (best for SSE) > Waitress (with more threads) > Flask dev server
+    print("Starting MusubiTLX server...")
+    print("Note: To run in background, use: nohup ./start_gui.sh > webgui.log 2>&1 &")
+    print("Or use screen/tmux for better session management.")
+    
+    server_started = False
+    
+    # Try gevent first - best for SSE streaming (async-friendly)
+    if not server_started:
+        try:
+            from gevent import monkey
+            monkey.patch_all()
+            from gevent.pywsgi import WSGIServer
+            print("Using gevent WSGIServer (recommended for SSE streaming)")
+            http_server = WSGIServer(('0.0.0.0', 5000), app, log=None)
+            server_started = True
+            http_server.serve_forever()
+        except ImportError:
+            print("gevent not installed. Install with: pip install gevent")
+    
+    # Fallback to Waitress with more threads for SSE
+    if not server_started:
+        try:
+            from waitress import serve
+            print("Using Waitress WSGI server (install gevent for better SSE: pip install gevent)")
+            # Use many more threads to handle SSE connections without blocking
+            # asyncore_use_poll=True helps with many concurrent connections
+            serve(app, host="0.0.0.0", port=5000, threads=32, 
+                  channel_timeout=300, asyncore_use_poll=True)
+            server_started = True
+        except ImportError:
+            print("waitress not installed.")
+    
+    # Last resort: Flask development server
+    if not server_started:
+        print("WARNING: Using Flask development server (not recommended for production)")
+        print("Install a production server: pip install gevent")
         app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

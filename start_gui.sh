@@ -267,31 +267,244 @@ if [ ! -d "src/musubi_tuner" ]; then
                         echo "✅ Virtual environment created!"
                         echo ""
                         
-                        # Install dependencies for musubi-tuner (same logic as the other location)
-                        # This is duplicated code but it's in a different execution path
-                        # TODO: Consider extracting to a function to avoid duplication
+                        # Install dependencies for musubi-tuner
                         echo "Dependencies need to be installed for musubi-tuner to work."
                         echo ""
                         read -p "Install dependencies automatically now? (Y/n) " -n 1 -r
                         echo
                         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                            # Same dependency installation logic as above - see lines ~484+ for full implementation
-                            # For brevity, directing to the main installation section
                             echo ""
-                            echo "Please run the script again to install dependencies, or install manually:"
+                            echo "Installing dependencies..."
+                            echo "This may take several minutes..."
+                            echo ""
+                            
+                            # GPU Detection
+                            echo "Checking for NVIDIA GPU..."
+                            if command -v nvidia-smi >/dev/null 2>&1; then
+                                echo "✅ NVIDIA GPU detected:"
+                                nvidia-smi --query-gpu=name --format=csv,noheader
+                                echo ""
+                            else
+                                echo "ℹ️  NVIDIA GPU not detected. Proceeding with CPU-only option recommended."
+                                echo ""
+                            fi
+                            
+                            # CUDA/MODEL PATH & TORCH SETUP - Interactive Menu
+                            echo "========================================"
+                            echo "Choose PyTorch installation:"
+                            echo "========================================"
+                            echo ""
+                            echo "[1] CUDA 12.1 (Stable & recommended for RTX 30/40-series)"
+                            echo "[2] CUDA 12.4 (Intermediate option, viable for RTX 50xx/Blackwell)"
+                            echo "[3] CUDA 12.8 (Latest stable - recommended for RTX 50xx/Blackwell, PyTorch 2.7+)"
+                            echo "[4] CPU only (No GPU acceleration)"
+                            echo "[5] Skip PyTorch (I will install myself)"
+                            echo ""
+                            read -p "Enter your choice (1-5): " cuda_choice
+                            
+                            TORCH_INSTALLED=0
+                            PYTORCH_INDEX_URL=""
+                            CUDA_VERSION=""
+                            
+                            case "$cuda_choice" in
+                                1)
+                                    CUDA_VERSION="12.1"
+                                    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu121"
+                                    ;;
+                                2)
+                                    CUDA_VERSION="12.4"
+                                    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu124"
+                                    ;;
+                                3)
+                                    CUDA_VERSION="12.8"
+                                    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+                                    echo ""
+                                    echo "Installing CUDA 12.8 (latest stable for Blackwell GPUs)."
+                                    echo ""
+                                    ;;
+                                4)
+                                    CUDA_VERSION="CPU"
+                                    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
+                                    echo ""
+                                    echo "⚠️  [WARNING] CPU-only installation selected. No GPU acceleration available."
+                                    echo "Training/inference will be very slow."
+                                    echo ""
+                                    ;;
+                                5)
+                                    echo ""
+                                    echo "⚠️  [WARNING] You have chosen to skip PyTorch installation."
+                                    echo "You must install the correct version yourself before the GUI can run with GPU."
+                                    echo "Consult PyTorch documentation for your CUDA version."
+                                    echo "Continuing without PyTorch..."
+                                    echo ""
+                                    TORCH_INSTALLED=0
+                                    ;;
+                                *)
+                                    echo ""
+                                    echo "❌ [ERROR] Invalid choice. Please select 1-5."
+                                    echo ""
+                                    deactivate 2>/dev/null || true
+                                    exit 1
+                                    ;;
+                            esac
+                            
+                            # Install PyTorch if not skipped
+                            if [ "$cuda_choice" != "5" ]; then
+                                echo "Step 1: Installing PyTorch and torchvision..."
+                                source venv/bin/activate
+                                if pip install torch torchvision torchaudio --index-url "$PYTORCH_INDEX_URL"; then
+                                    TORCH_INSTALLED=1
+                                    echo ""
+                                    echo "✅ PyTorch installed successfully!"
+                                    echo ""
+                                    
+                                    # PyTorch Validation
+                                    echo "Validating PyTorch installation..."
+                                    if python -c "import torch; print('PyTorch version:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA version:', torch.version.cuda if hasattr(torch.version, 'cuda') else 'N/A')" 2>/dev/null; then
+                                        echo ""
+                                        echo "✅ PyTorch validated successfully."
+                                        python -c "import torch; print('CUDA support:', 'Available' if torch.cuda.is_available() else 'Not available (CPU-only mode)')" 2>/dev/null
+                                        echo ""
+                                    else
+                                        echo ""
+                                        echo "⚠️  [WARNING] PyTorch validation failed. You may need to troubleshoot installation manually."
+                                        echo "Check PyTorch official documentation."
+                                        echo ""
+                                    fi
+                                else
+                                    echo ""
+                                    echo "⚠️  [WARNING] PyTorch installation failed."
+                                    read -p "Continue anyway? (y/N) " -n 1 -r
+                                    echo
+                                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                        echo ""
+                                        echo "Installation aborted. Please install PyTorch manually."
+                                        echo ""
+                                        deactivate
+                                        exit 1
+                                    fi
+                                    echo ""
+                                    echo "Continuing without PyTorch validation..."
+                                    TORCH_INSTALLED=0
+                                fi
+                                deactivate
+                            fi
+                            
+                            # Install musubi-tuner dependencies (from pyproject.toml or requirements.txt)
+                            echo ""
+                            echo "Step 2: Installing musubi-tuner dependencies..."
+                            source venv/bin/activate
+                            
+                            # Check if pyproject.toml exists (preferred)
+                            if [ -f "pyproject.toml" ]; then
+                                echo "Installing from pyproject.toml..."
+                                if pip install -e .; then
+                                    echo ""
+                                    echo "✅ musubi-tuner installed successfully!"
+                                    echo ""
+                                else
+                                    echo ""
+                                    echo "⚠️  [WARNING] musubi-tuner installation may have failed."
+                                    read -p "Continue anyway? (y/N) " -n 1 -r
+                                    echo
+                                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                        echo ""
+                                        echo "Installation aborted. Please install musubi-tuner manually: pip install -e ."
+                                        echo ""
+                                        deactivate
+                                        exit 1
+                                    fi
+                                    echo ""
+                                fi
+                            elif [ -f "requirements.txt" ]; then
+                                echo "Installing from requirements.txt..."
+                                if pip install -r requirements.txt; then
+                                    echo ""
+                                    echo "✅ Dependencies installed successfully!"
+                                    echo ""
+                                else
+                                    echo ""
+                                    echo "⚠️  [WARNING] Dependencies installation may have failed."
+                                    read -p "Continue anyway? (y/N) " -n 1 -r
+                                    echo
+                                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                        echo ""
+                                        echo "Installation aborted. Please install dependencies manually."
+                                        echo ""
+                                        deactivate
+                                        exit 1
+                                    fi
+                                    echo ""
+                                fi
+                            else
+                                echo "ℹ️  [INFO] No requirements.txt found in musubi-tuner. Skipping Musubi dependency installation."
+                                echo ""
+                            fi
+                            
+                            # Install GUI dependencies (from webgui.py imports)
+                            echo "Step 3: Installing GUI dependencies..."
+                            echo "Installing Flask, PyYAML, toml, waitress, psutil..."
+                            if pip install Flask PyYAML toml waitress psutil; then
+                                echo ""
+                                echo "✅ GUI dependencies installed successfully!"
+                                echo ""
+                            else
+                                echo ""
+                                echo "⚠️  [WARNING] Some GUI dependencies may have failed to install."
+                                echo "You may need to install them manually: pip install Flask PyYAML toml waitress psutil"
+                                echo ""
+                            fi
+                            
+                            # Optional: gevent for better SSE streaming (live log updates)
+                            echo "Optional: Install gevent for better live log streaming?"
+                            echo "  - gevent improves real-time log updates during training"
+                            echo "  - Without it, logs may update with slight delays"
+                            echo ""
+                            read -p "Install gevent? (y/N) " -n 1 -r
+                            echo
+                            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                                echo "Installing gevent..."
+                                if pip install gevent; then
+                                    echo ""
+                                    echo "✅ gevent installed successfully!"
+                                    echo ""
+                                else
+                                    echo ""
+                                    echo "⚠️  gevent installation failed. Live logs will work but may be less responsive."
+                                    echo ""
+                                fi
+                            fi
+                            
+                            # Optional dependencies
+                            echo "Optional: Install additional dependencies for extra features?"
+                            echo "  - ascii-magic (dataset verification)"
+                            echo "  - matplotlib (timestep visualization)"
+                            echo "  - tensorboard (training progress logging)"
+                            echo "  - prompt-toolkit (interactive prompt editing)"
+                            echo ""
+                            read -p "Install optional dependencies? (y/N) " -n 1 -r
+                            echo
+                            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                                echo ""
+                                echo "Installing optional dependencies..."
+                                if pip install ascii-magic matplotlib tensorboard prompt-toolkit; then
+                                    echo ""
+                                    echo "✅ Optional dependencies installed successfully!"
+                                    echo ""
+                                else
+                                    echo ""
+                                    echo "⚠️  [WARNING] Some optional dependencies may have failed to install."
+                                    echo ""
+                                fi
+                            fi
+                            deactivate
+                        else
+                            echo ""
+                            echo "To install dependencies manually, run:"
                             echo "  source venv/bin/activate"
                             echo "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
                             echo "  pip install -e ."
                             echo ""
-                        fi
-                        
-                        read -p "Continue with model check anyway? (Y/n) " -n 1 -r
-                        echo
-                        if [[ $REPLY =~ ^[Nn]$ ]]; then
-                            echo ""
-                            echo "Virtual environment created. You can install dependencies later if needed."
-                            echo ""
-                            exit 0
                         fi
                     else
                         echo "❌ Failed to create virtual environment. Please create it manually."

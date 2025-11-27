@@ -1,10 +1,38 @@
 ## MusubiTLX – Qwen LoRA Training Web GUI
 
+**Version 0.2**
+
 MusubiTLX is a small web interface for training Qwen‑Image LoRA networks using **Musubi Tuner**.
 It wraps the existing Musubi training scripts in a simple, browser‑based GUI.
 
 Musubi Tuner itself is developed in the main project repository: [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner).
 
+### Quick Start for New Users
+
+**New to MusubiTLX?** The easiest way to get started:
+
+1. Download or clone [MusubiTLX-gui](https://github.com/sajb0t/MusubiTLX-gui) (contains `webgui.py` and start scripts)
+2. Run the start script:
+   ```bash
+   ./start_gui.sh  # Linux/macOS
+   # or
+   start_gui.bat   # Windows
+   ```
+3. The script will guide you through:
+   - Cloning musubi-tuner automatically (if needed)
+   - Creating virtual environment
+   - Downloading required model files
+   - Starting the web server
+
+Everything is interactive – just answer the prompts!
+
+### What's New in 0.2
+
+- **Improved start scripts**: Full interactive setup with automatic PyTorch installation (CUDA version selection), dependency installation, and model downloads
+- **Better live log streaming**: Added gevent WSGI server support for smoother real-time training log updates
+- **All three models downloadable**: Text Encoder (`qwen_2.5_vl_7b.safetensors`) now included in automatic model download
+- **System monitoring**: Added psutil dependency for accurate RAM/VRAM monitoring
+- **Bug fixes**: Fixed various issues with SSE streaming and server stability
 
 ---
 
@@ -93,14 +121,15 @@ Musubi Tuner itself is developed in the main project repository: [Musubi Tuner](
   - Caption models are automatically unloaded before training starts to free VRAM.
 
 - **Production‑style server**
-  - Uses `waitress` WSGI server when available.
-  - Falls back to Flask's development server only if `waitress` is not installed.
+  - Uses `gevent` WSGI server when available (best for live log streaming).
+  - Falls back to `waitress` (32 threads) if gevent is not installed.
+  - Falls back to Flask's development server only if neither is installed.
 
 ---
 
 ### 2. Requirements & Dependencies
 
-Assuming you already have **Musubi Tuner** cloned (this GUI lives in the same repository).
+**Note:** If you use the start scripts (`start_gui.sh` / `start_gui.bat`), they can automatically clone **Musubi Tuner** for you if it's missing. Otherwise, you need to have **Musubi Tuner** cloned first (this GUI lives in the same repository).
 
 #### Python
 
@@ -111,9 +140,11 @@ Assuming you already have **Musubi Tuner** cloned (this GUI lives in the same re
 The GUI depends on:
 
 - `Flask`
-- `waitress`
+- `waitress` (production WSGI server)
+- `gevent` (optional, recommended for better live log streaming)
 - `PyYAML`
 - `toml`
+- `psutil` (for RAM/VRAM monitoring)
 
 Musubi Tuner itself has additional requirements (PyTorch, safetensors, etc.) which should already be installed according to the main project’s README.
 
@@ -128,7 +159,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Extra for the web GUI
-pip install flask waitress pyyaml toml
+pip install flask waitress pyyaml toml psutil
+
+# Optional: For better live log streaming during training
+pip install gevent
 ```
 
 If you plan to use `AdamW8bit`, you also need:
@@ -149,18 +183,97 @@ pip install "transformers>=4.44.0" pillow
 
 ### 3. Starting the GUI
 
-From the Musubi Tuner project root:
+The start scripts provide an **interactive installation and setup process** that can automatically:
+- Clone musubi-tuner repository if missing
+- Create virtual environment
+- Download required model files
+- Start the server with SSH disconnect protection
 
+#### Option 1: Using the start script (Recommended)
+
+**Linux/macOS:**
+```bash
+# If you only have the MusubiTLX-gui files (webgui.py), the script will:
+# 1. Detect that musubi-tuner is missing
+# 2. Offer to clone it automatically
+# 3. Set up everything for you
+./start_gui.sh
+```
+
+**Available flags:**
+- `./start_gui.sh` – Start in background (survives SSH disconnect, recommended)
+- `./start_gui.sh --fg` – Start in foreground (interactive mode, use Ctrl+C to stop)
+- `./start_gui.sh --stop` – Stop the running server
+- `./start_gui.sh --status` – Check if server is running
+
+**What the start script does:**
+1. **Repository check**: Detects if you're in the musubi-tuner repository. If not, offers to:
+   - Automatically clone musubi-tuner from GitHub
+   - Or copy `webgui.py` to an existing musubi-tuner directory
+2. **Virtual environment check**: If missing, offers to create it automatically
+3. **Dependency installation**: Offers to install PyTorch (with CUDA version selection), musubi-tuner dependencies, and GUI dependencies
+4. **Model file check**: Detects missing models and offers automatic download:
+   - DiT Model (`qwen_image_bf16.safetensors`) ~7 GB - required for training
+   - VAE Model (`diffusion_pytorch_model.safetensors`) ~335 MB - required for training
+   - Text Encoder (`qwen_2.5_vl_7b.safetensors`) ~16 GB - needed for Qwen-VL auto-captioning
+5. **Server startup**: Starts the server in the background with nohup (survives SSH disconnect)
+
+**Stopping the server:**
+```bash
+# Option 1: Use the --stop flag
+./start_gui.sh --stop
+
+# Option 2: Use the separate stop script
+./stop_gui.sh
+
+# Option 3: Use the process ID shown when starting
+kill <PID>
+```
+
+**Windows:**
+```cmd
+cd C:\path\to\musubi-tuner
+start_gui.bat
+```
+
+**Available flags:**
+- `start_gui.bat` – Start in background
+- `start_gui.bat --stop` – Stop the running server
+- `start_gui.bat --status` – Check if server is running
+
+**Stopping the server (Windows):**
+```cmd
+start_gui.bat --stop
+REM or
+stop_gui.bat
+```
+
+This will start the server in the background with logs written to `webgui.log`.
+
+#### Option 2: Manual start
+
+**Linux/macOS:**
 ```bash
 cd /path/to/musubi-tuner
 source venv/bin/activate
 python webgui.py
 ```
 
-If `waitress` is installed, you’ll see a message like:
+**Windows:**
+```cmd
+cd C:\path\to\musubi-tuner
+venv\Scripts\activate
+python webgui.py
+```
+
+When the server starts, you'll see a message indicating which WSGI server is being used:
 
 ```text
-Starting MusubiTLX with waitress...
+Starting MusubiTLX with gevent...     # Best for live log streaming
+# or
+Starting MusubiTLX with waitress...   # Good fallback
+# or
+Starting MusubiTLX with Flask dev server...  # Development only
 ```
 
 The GUI will be available at:
@@ -168,17 +281,25 @@ The GUI will be available at:
 - `http://127.0.0.1:5000` (local machine)
 - Or `http://<your-LAN-IP>:5000` for other devices on the same network.
 
+**Note:** The start scripts (`start_gui.sh` / `start_gui.bat`) automatically handle SSH disconnect protection, interactive setup, and are recommended for production use. They can automatically set up everything needed for first-time users.
+
 ---
 
 ### 4. Using the GUI
 
 #### Step 1 – Download required models (once)
 
-At the top of the page:
+**Option 1: Automatic download via start script**
+
+If you use the start script (`./start_gui.sh` or `start_gui.bat`), it will automatically detect missing model files and offer to download them. This is the easiest way for new users.
+
+**Option 2: Download via GUI**
+
+At the top of the web GUI page:
 
 - Click the buttons to download:
   - `DiT Model` (`qwen_image_bf16.safetensors`)
-  - `Text Encoder` (`qwen_2.5_vl_7b.safetensors`)
+  - `Text Encoder` (`qwen_2.5_vl_7b.safetensors` – optional, for auto-captioning)
   - `VAE Model` (`diffusion_pytorch_model.safetensors`)
 
 These are saved in the current working directory and used by Musubi Tuner's training scripts.

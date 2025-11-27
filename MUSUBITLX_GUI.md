@@ -213,9 +213,9 @@ The start scripts provide an **interactive installation and setup process** that
 2. **Virtual environment check**: If missing, offers to create it automatically
 3. **Dependency installation**: Offers to install PyTorch (with CUDA version selection), musubi-tuner dependencies, and GUI dependencies
 4. **Model file check**: Detects missing models and offers automatic download:
-   - DiT Model (`qwen_image_bf16.safetensors`) ~7 GB - required for training
+   - DiT Model (`qwen_image_bf16.safetensors`) ~38 GB - required for training
    - VAE Model (`diffusion_pytorch_model.safetensors`) ~335 MB - required for training
-   - Text Encoder (`qwen_2.5_vl_7b.safetensors`) ~16 GB - needed for Qwen-VL auto-captioning
+   - Text Encoder (`qwen_2.5_vl_7b.safetensors`) ~16 GB - needed for Qwen-VL auto-captioning and image training.
 5. **Server startup**: Starts the server in the background with nohup (survives SSH disconnect)
 
 **Stopping the server:**

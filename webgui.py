@@ -167,7 +167,7 @@ def load_blip_caption_model():
 def load_qwen_vl_caption_model():
     """
     Lazy-load Qwen2.5-VL model for highly detailed captions.
-    Automatically finds the model in the project directory.
+    Automatically finds the model in the project directory, or downloads it if missing.
     """
     global caption_qwen_vl_model, caption_qwen_vl_processor
     if caption_qwen_vl_model is not None and caption_qwen_vl_processor is not None:
@@ -181,24 +181,91 @@ def load_qwen_vl_caption_model():
     from PIL import Image
 
     # Try to find the model automatically in common locations
-    possible_paths = [
-        os.environ.get("CAPTION_MODEL_PATH_QWEN_VL", ""),  # User override
-        "qwen_2.5_vl_7b.safetensors",  # Project root
-        os.path.join(os.path.dirname(__file__), "qwen_2.5_vl_7b.safetensors"),  # Same dir as webgui.py
-        os.path.join(os.getcwd(), "qwen_2.5_vl_7b.safetensors"),  # Current working directory
-    ]
+    # IMPORTANT: Check same dir as webgui.py FIRST (most common location)
+    webgui_dir = os.path.dirname(os.path.abspath(__file__))
+    model_filename = "qwen_2.5_vl_7b.safetensors"
     
+    # Build list of possible paths to check
+    possible_paths = []
+    
+    # 1. User override via environment variable
+    env_path = os.environ.get("CAPTION_MODEL_PATH_QWEN_VL", "")
+    if env_path:
+        possible_paths.append(env_path)
+    
+    # 2. Same directory as webgui.py (MOST COMMON - check this first!)
+    webgui_path = os.path.join(webgui_dir, model_filename)
+    possible_paths.append(webgui_path)
+    
+    # 3. Current working directory
+    cwd_path = os.path.join(os.getcwd(), model_filename)
+    possible_paths.append(cwd_path)
+    
+    # 4. Relative path from current directory
+    possible_paths.append(model_filename)
+    
+    # Check all possible paths
     model_path = None
     for path in possible_paths:
-        if path and os.path.exists(path) and os.path.isfile(path):
-            model_path = path
+        if not path:
+            continue
+        # Try both absolute and relative path
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path) and os.path.isfile(abs_path):
+            model_path = abs_path
+            break
+        if os.path.exists(path) and os.path.isfile(path):
+            model_path = os.path.abspath(path)
             break
     
+    # CRITICAL: Only download if model_path is STILL None after checking ALL paths
     if not model_path:
-        raise RuntimeError(
-            "Qwen-VL model not found.\n"
-            "Please ensure 'qwen_2.5_vl_7b.safetensors' is in the project directory, or set CAPTION_MODEL_PATH_QWEN_VL environment variable."
-        )
+        # Use the same URL as in DOWNLOADS dictionary
+        qwen_vl_url = DOWNLOADS.get("Text Encoder", "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b.safetensors?download=true")
+        
+        # Try downloading to project root (same directory as webgui.py)
+        download_path = os.path.join(webgui_dir, model_filename)
+        
+        # ABSOLUTE FINAL CHECK: Make absolutely sure file doesn't exist before downloading
+        # Check both absolute and relative paths one more time
+        if os.path.exists(download_path) and os.path.isfile(download_path):
+            model_path = os.path.abspath(download_path)
+        elif os.path.exists(os.path.abspath(download_path)) and os.path.isfile(os.path.abspath(download_path)):
+            model_path = os.path.abspath(download_path)
+        elif not os.path.exists(download_path) and not os.path.exists(os.path.abspath(download_path)):
+            try:
+                print(f"Qwen-VL model not found. Downloading from Hugging Face...")
+                print(f"This is a large file (~14GB) and may take several minutes.")
+                download_with_progress(qwen_vl_url, download_path)
+                print(f"Download completed: {download_path}")
+                if os.path.exists(download_path) and os.path.isfile(download_path):
+                    model_path = download_path
+            except Exception as e:
+                # If download fails, try current working directory as fallback
+                download_path = model_filename
+                if os.path.exists(download_path) and os.path.isfile(download_path):
+                    model_path = os.path.abspath(download_path)
+                elif not os.path.exists(download_path):
+                    try:
+                        download_with_progress(qwen_vl_url, download_path)
+                        print(f"Download completed: {download_path}")
+                        if os.path.exists(download_path) and os.path.isfile(download_path):
+                            model_path = os.path.abspath(download_path)
+                    except Exception as e2:
+                        raise RuntimeError(
+                            f"Qwen-VL model not found and automatic download failed.\n"
+                            f"Download error: {e2}\n"
+                            f"Please download 'qwen_2.5_vl_7b.safetensors' manually from:\n"
+                            f"{qwen_vl_url}\n"
+                            f"Or set CAPTION_MODEL_PATH_QWEN_VL environment variable to point to the model file."
+                        )
+        
+        # Verify the file exists
+        if not model_path or not (os.path.exists(model_path) and os.path.isfile(model_path)):
+            raise RuntimeError(
+                "Qwen-VL model not found.\n"
+                "Please ensure 'qwen_2.5_vl_7b.safetensors' is in the project directory, or set CAPTION_MODEL_PATH_QWEN_VL environment variable."
+            )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -327,11 +394,19 @@ HTML = r'''
 <html>
 <head>
   <title>MusubiTLX – Qwen LoRA Training Panel</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
+    html { scroll-behavior: smooth; }
     body { font-family: 'Inter', Arial, sans-serif; background: #222; color: #eee; margin:0;}
     .container { background: #2b2f33; box-shadow: 0 0 18px rgba(0,0,0,0.75); padding: 2.2em; max-width: 1100px; margin: 2.2em auto; border-radius: 22px;}
     .section { background: #23272E; border-radius:16px; margin-bottom: 24px; padding: 1.25em 1.7em;}
-    .section h3 { margin-top:0; color: #86c6fe; font-size: 1.28em; font-weight:600; letter-spacing:0.02em;}
+    .section h3 { margin-top:0; color: #86c6fe; font-size: 1.28em; font-weight:600; letter-spacing:0.02em; cursor: pointer; user-select: none; display: flex; align-items: center; justify-content: space-between; gap: 12px;}
+    .section h3:hover { color: #00ddcb; }
+    .section-toggle { font-size: 0.9em; color: #86c6fe; transition: transform 0.3s ease; display: inline-block; }
+    .section.collapsed .section-toggle { transform: rotate(-90deg); }
+    .section-content { overflow: hidden; transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease; padding-top: 0.5em; }
+    .section.collapsed .section-content { max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; margin: 0; }
+    .section:not(.collapsed) .section-content { max-height: 10000px; opacity: 1; }
     input, select, textarea { width: 96%; padding: 8px; margin: 6px 0 16px; border-radius: 6px; border: 1px solid #666; background: #1e2023; color: #eee; font-size: 1.09rem;}
     input[type="file"] { display: none; }
     .file-input-wrapper { position: relative; width: 96%; }
@@ -354,21 +429,112 @@ HTML = r'''
     .imglist.dragover { border-color: #00ddcb; background: rgba(0,221,203,0.04); }
     .gallery { display:flex; flex-wrap:wrap; gap:20px; margin-top:10px;}
     .imgbox { background:#151618; border-radius:13px; box-shadow:0 0 8px #444 inset; padding:13px; text-align:center; width:190px; position:relative;}
-    .imgbox img { max-width:170px; max-height:170px; border-radius:7px; box-shadow:0 0 7px #262f2a;}
+    .imgbox img { max-width:170px; max-height:170px; border-radius:7px; box-shadow:0 0 7px #262f2a; cursor: pointer; transition: transform 0.2s ease; }
+    .imgbox img:hover { transform: scale(1.05); }
+    .image-zoom-modal { display: none; position: fixed; z-index: 10000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.9); cursor: pointer; }
+    .image-zoom-modal.active { display: flex; align-items: center; justify-content: center; }
+    .image-zoom-content { max-width: 90%; max-height: 90%; position: relative; }
+    .image-zoom-content img { max-width: 100%; max-height: 90vh; border-radius: 8px; box-shadow: 0 0 30px rgba(0, 152, 255, 0.5); }
+    .image-zoom-close { position: absolute; top: -40px; right: 0; color: #fff; font-size: 32px; font-weight: bold; cursor: pointer; text-shadow: 0 0 10px rgba(0, 0, 0, 0.8); }
+    .image-zoom-close:hover { color: #00ddcb; }
     .imgbox input[type=text] { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border: 1px solid #666; }
     .caption-textarea { width:97%; margin-top:10px; background:#222; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.25; min-height:3.2em; resize:vertical; }
     .imgbox-remove { position:absolute; top:5px; right:5px; background:#ff4444; color:#fff; border:none; border-radius:50%; width:24px; height:24px; cursor:pointer; font-size:16px; font-weight:bold; line-height:1; padding:0; display:flex; align-items:center; justify-content:center; opacity:0.8; }
     .imgbox-remove:hover { opacity:1; background:#ff6666; }
     .advanced-textarea { width:96%; background:#1e2023; color:#eee; border-radius:6px; border:1px solid #666; font-size:0.9rem; line-height:1.3; min-height:6em; }
-    .title { font-size:2.1em; color:#a1e6ff; letter-spacing:1px; margin-bottom:0.3em; text-align:left;}
+    .title { 
+      font-size: 2.4em; 
+      background: linear-gradient(135deg, #0098FF 0%, #00ddcb 50%, #86c6fe 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: 0.5px; 
+      margin-bottom: 0.5em; 
+      text-align: left;
+      font-weight: 700;
+      text-shadow: 0 0 30px rgba(0, 152, 255, 0.3);
+      position: relative;
+      padding-bottom: 12px;
+    }
+    .title::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 100%;
+      height: 2px;
+      background: linear-gradient(90deg, #0098FF 0%, #00ddcb 100%);
+      border-radius: 2px;
+      opacity: 0.6;
+    }
+    .nav-links {
+      display: flex;
+      gap: 20px;
+      margin-top: 16px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      padding: 12px 20px;
+      border-bottom: 1px solid rgba(0, 152, 255, 0.2);
+      position: sticky;
+      top: 0;
+      background: #2b2f33;
+      z-index: 100;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+    }
+    .nav-links a {
+      color: #86c6fe;
+      text-decoration: none;
+      font-size: 0.95em;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 6px;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+    .nav-links a:hover {
+      color: #00ddcb;
+      background: rgba(0, 152, 255, 0.1);
+      transform: translateY(-1px);
+    }
+    .nav-links a.active {
+      color: #00ddcb;
+      background: rgba(0, 152, 255, 0.15);
+    }
+    .nav-links a::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 0;
+      height: 2px;
+      background: linear-gradient(90deg, #0098FF 0%, #00ddcb 100%);
+      transition: width 0.3s ease;
+    }
+    .nav-links a:hover::after,
+    .nav-links a.active::after {
+      width: 80%;
+    }
     .model-list { margin-bottom: 15px; }
     .model-list form { display: inline; }
     .model-list button { margin-right: 8px; }
     .footer { margin-top: 24px; font-size: 0.9em; color:#999; text-align:right; }
     .footer a { color:#7abfff; text-decoration:none; margin-left:12px; }
     .footer a:hover { text-decoration:underline; }
-    .status-box { margin-top:8px; font-size:0.9em; color:#b3daff; }
+    .status-box { margin-top:8px; font-size:0.9em; color:#b3daff; word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; }
+    .validation-error { background: #3d1a1a; border: 2px solid #ff4444; border-radius: 8px; padding: 16px; margin: 16px 0; color: #ffaaaa; }
+    .validation-error h4 { margin: 0 0 12px 0; color: #ff6666; font-size: 1.1em; }
+    .validation-error ul { margin: 8px 0 0 20px; padding: 0; }
+    .validation-error li { margin: 6px 0; }
+    .field-error { border: 2px solid #ff4444 !important; background: #2a1a1a !important; }
+    .progress-bar-container { width: 100%; background: #1a1d24; border-radius: 8px; height: 24px; margin-top: 8px; overflow: hidden; border: 1px solid #444; position: relative; }
+    .progress-bar-fill { height: 100%; background: linear-gradient(90deg, #0098FF, #00ddcb); transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 0.75em; font-weight: 600; }
+    .progress-bar-text { width: 100%; text-align: center; color: #b3daff; font-size: 0.85em; margin-top: 4px; word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; }
     .cmd-preview { background:#111317; border-radius:8px; padding:8px 10px; margin-top:6px; font-size:0.9em; color:#d8f4ff; max-height:140px; overflow-y:auto; white-space:pre-wrap; }
+    .loss-chart-container { background:#1a1d24; border-radius:8px; padding:16px; margin-top:16px; border:1px solid #444; }
+    .loss-chart-container h4 { margin:0 0 12px 0; color:#86c6fe; font-size:1em; font-weight:600; }
+    #loss-chart-canvas { max-height:300px; }
     .info-icon-wrapper { display: inline-flex; align-items: center; gap: 6px; }
     .info-icon { display: inline-block; width: 18px; height: 18px; border-radius: 50%; background: #0098FF; color: #fff; text-align: center; line-height: 18px; font-size: 12px; font-weight: bold; cursor: help; position: relative; flex-shrink: 0; }
     .info-icon:hover { background: #00ddcb; }
@@ -388,7 +554,7 @@ HTML = r'''
     .sample-card { width:190px; background:#151618; border-radius:12px; padding:10px; box-shadow:0 0 8px rgba(0,0,0,0.4); transition:transform 0.2s ease; }
     .sample-card:hover { transform:translateY(-3px); box-shadow:0 6px 16px rgba(0,0,0,0.45); }
     .sample-card a { color:inherit; text-decoration:none; display:block; }
-    .sample-card img, .sample-card video { width:100%; border-radius:8px; object-fit:cover; max-height:150px; background:#0f1012; }
+    .sample-card img, .sample-card video { width:100%; border-radius:8px; object-fit:cover; max-height:150px; background:#0f1012; cursor: pointer; }
     .sample-card-meta { font-size:0.85em; color:#bbb; margin-top:6px; word-break:break-word; }
     .sample-gallery-empty { border:1px dashed #444; border-radius:10px; padding:14px; color:#777; font-size:0.95em; display:flex; justify-content:center; align-items:center; min-height:80px; width:100%; }
     .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-top: 12px; }
@@ -411,8 +577,20 @@ HTML = r'''
 <body>
   <div class="container">
     <div class="title">MusubiTLX – Qwen LoRA Training</div>
-    <div class="section model-list">
-      <h3>Model files (download from Hugging Face)</h3>
+    <div class="nav-links">
+      <a href="#model-files">Model Files</a>
+      <a href="#upload-images">Upload Images</a>
+      <a href="#training-settings">Training Settings</a>
+      <a href="#preview">Preview & Captions</a>
+      <a href="#system-resources">System Resources</a>
+      <a href="#training-output">Training Output</a>
+    </div>
+    <div class="section model-list" id="model-files">
+      <h3 onclick="window.toggleSection && window.toggleSection('model-files')">
+        <span>Model files (download from Hugging Face)</span>
+        <span class="section-toggle">▼</span>
+      </h3>
+      <div class="section-content">
       {% for label, url in downloads.items() %}
         <form method="POST">
           <input type="hidden" name="dl_label" value="{{label}}">
@@ -421,30 +599,49 @@ HTML = r'''
         </form>
       {% endfor %}
       {% if download_msg %}<div style="margin-top:10px;">{{download_msg}}</div>{% endif %}
+      </div>
     </div>
     <form id="training-form" method="POST" enctype="multipart/form-data">
-      <div class="section">
-        <h3>1. Upload training images</h3>
+      <div class="section" id="upload-images">
+        <h3 onclick="window.toggleSection && window.toggleSection('upload-images')">
+          <span>1. Upload training images</span>
+          <span class="section-toggle">▼</span>
+        </h3>
+        <div class="section-content">
         <label>Select images (multiple allowed)</label>
         <div class="file-input-wrapper">
           <label for="images" class="file-input-label">Choose images</label>
           <button type="button" class="file-input-clear-btn" id="clear-images-btn" onclick="window.clearSelectedImages && window.clearSelectedImages()" style="display:none;">Clear all</button>
           <span class="file-input-text" id="file-input-status">No files selected</span>
-          <input type="file" id="images" name="images" multiple accept="image/*" onchange="window.previewImages && window.previewImages(event)">
+          <input type="file" id="images" name="images" multiple accept="image/*" onchange="window.handleFileInputChange && window.handleFileInputChange(event)">
         </div>
-        <div class="imglist imglist-empty" id="preview">
+        <div class="imglist imglist-empty" id="preview" style="scroll-margin-top: 100px;">
           <div class="drop-hint">
             Drag &amp; drop images here or use the file picker above.
           </div>
         </div>
-      <button type="button" id="autocap-btn" onclick="window.autoCaptionCaptionModel && window.autoCaptionCaptionModel()">
+      <div id="autocap-status" class="status-box" style="display:none; margin-top:12px;"></div>
+      <div id="autocap-progress-container" style="display:none; margin-top:12px;">
+        <div class="progress-bar-container">
+          <div id="autocap-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+      <button type="button" id="autocap-btn" onclick="window.autoCaptionCaptionModel && window.autoCaptionCaptionModel()" style="margin-top:16px;">
         Auto-caption images
       </button>
-      <small style="color:#888; display:block; margin-top:4px;">
-        First run will download and load the captioning model and can take a while. Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works (see the GUI README for the exact <code>pip install</code> command).
-      </small>
-      <label style="margin-top:8px;">
+      <label class="info-icon-wrapper" style="margin-top:16px;">
         Caption model (auto-caption)
+        <span class="info-icon">
+          ?
+          <span class="info-tooltip">
+            <strong>Captioning Dependencies:</strong>
+            Captioning dependencies must be installed manually in your Musubi Tuner virtual environment before this feature works.
+            <br><br>
+            See the GUI README for the exact <code>pip install</code> command.
+            <br><br>
+            <strong>Note:</strong> The first time you use a caption model, it will be automatically downloaded from Hugging Face. Qwen-VL is a large file (~14GB) and may take 10-15 minutes to download.
+          </span>
+        </span>
       </label>
       <select id="caption_model" name="caption_model">
         <option value="vit-gpt2" selected>ViT-GPT2 – fast, lightweight</option>
@@ -468,12 +665,55 @@ HTML = r'''
       <div style="font-size:0.8em; color:#888; margin-top:4px; font-style:italic;">
         Note: BLIP-large has inherent limitations and may not describe very fine details like specific lighting conditions or facial features in extreme detail, even at level 5.
       </div>
-      <div id="autocap-status" class="status-box" style="display:none;"></div>
         <input type="hidden" name="uploaded_count" id="uploaded_count">
       </div>
-      <div class="section">
-        <h3>2. Training settings</h3>
+      </div>
+      <div class="section" id="training-settings">
+        <h3 onclick="window.toggleSection && window.toggleSection('training-settings')">
+          <span>2. Training settings</span>
+          <span class="section-toggle">▼</span>
+        </h3>
+        <div class="section-content">
         <div class="form-grid">
+          <div class="field-group field-group-wide">
+            <label class="info-icon-wrapper">
+              Training preset
+              <span class="info-icon">
+                ?
+                <span class="info-tooltip">
+                  <strong>Training Presets:</strong>
+                  Choose a preset to automatically configure training parameters, or select "Custom" to set everything manually.
+                  <br><br>
+                  <strong>Presets:</strong>
+                  <ul>
+                    <li><strong>Custom:</strong> Manual control over all settings</li>
+                    <li><strong>Fast Training:</strong> Quick tests, rapid prototyping (2 epochs, LR: 5e-5, rank 16, alpha 16, ~16 total repeats/image)</li>
+                    <li><strong>Balanced:</strong> General purpose, recommended default (3 epochs, LR: 4e-5, rank 32, alpha 32, ~18 total repeats/image)</li>
+                    <li><strong>High Quality:</strong> Detailed textures, production quality (4 epochs, LR: 3e-5, rank 64, alpha 32, ~20 total repeats/image)</li>
+                    <li><strong>Person/Character:</strong> Training specific people/characters (3 epochs, LR: 5e-5, rank 32, alpha 32, 50-60 total repeats for likeness)</li>
+                    <li><strong>Style/Concept:</strong> Artistic styles, abstract concepts (4 epochs, LR: 2e-5, rank 16, alpha 8, ~20 total repeats/image)</li>
+                    <li><strong>Few Images (&lt;30):</strong> Small datasets, prevents overfitting (5 epochs, LR: 2e-5, rank 16, alpha 16, 50+ total repeats minimum)</li>
+                    <li><strong>Many Images (100+):</strong> Large datasets, comprehensive training (3 epochs, LR: 5e-5, rank 64, alpha 32, ~6 total repeats/image)</li>
+                  </ul>
+                  <strong>Note:</strong> Epochs, repeats, and learning rate are automatically adjusted based on the number of uploaded images to optimize training.
+                  <strong>Note:</strong> Adjust presets based on your specific dataset and needs.
+                </span>
+              </span>
+            </label>
+            <select id="training-preset" name="training_preset" onchange="window.applyTrainingPreset && window.applyTrainingPreset()">
+              <option value="custom" selected>Custom (manual settings)</option>
+              <option value="fast">Fast Training</option>
+              <option value="balanced">Balanced</option>
+              <option value="high-quality">High Quality</option>
+              <option value="person">Person/Character</option>
+              <option value="style">Style</option>
+              <option value="few-images">Few Images (&lt;30 images)</option>
+              <option value="many-images">Many Images (100+ images)</option>
+            </select>
+            <small style="color: #888; display: block; margin-top: -8px; margin-bottom: 10px;">
+              Select a preset to auto-fill training parameters, or choose "Custom" to set everything manually.
+            </small>
+          </div>
           <div class="field-group">
             <label>Trigger word (label used in captions)</label>
             <input name="trigger" type="text" value="{{trigger}}">
@@ -704,11 +944,16 @@ HTML = r'''
           <button type="submit" id="saveyaml-btn" name="action" value="saveyaml">Save configuration as YAML</button>
           <button type="submit" id="loadyaml-btn" name="action" value="loadyaml">Load last YAML config</button>
         </div>
+        </div>
       </div>
     </form>
     {% if uploaded_gallery %}
-      <div class="section">
-        <h3>3. Preview images & captions</h3>
+      <div class="section" id="preview-captions">
+        <h3 onclick="window.toggleSection && window.toggleSection('preview-captions')">
+          <span>3. Preview images & captions</span>
+          <span class="section-toggle">▼</span>
+        </h3>
+        <div class="section-content">
         <div class="gallery">
         {% for fname, cap in uploaded_gallery %}
           <div class="imgbox">
@@ -716,6 +961,7 @@ HTML = r'''
             <div style="word-break:break-word; font-size:1.05em; margin-top:8px;">{{cap}}</div>
           </div>
         {% endfor %}
+        </div>
         </div>
       </div>
     {% endif %}
@@ -731,14 +977,13 @@ HTML = r'''
         </svg>
       </div>
     </div>
-    {% if saved_yaml %}
-      <div class="yaml-preview">
-        <strong>Saved YAML configuration:</strong><br>
-        <pre>{{saved_yaml}}</pre>
-      </div>
-    {% endif %}
-    <div class="section" style="margin-top: 20px;">
-      <div id="system-resources" style="background: #1a1d24; border-radius: 8px; padding: 12px 16px; border: 1px solid #444;">
+    <div class="section" style="margin-top: 20px;" id="system-resources">
+      <h3 onclick="window.toggleSection && window.toggleSection('system-resources')" style="margin-top:0; color: #86c6fe; font-size: 1.28em; font-weight:600; letter-spacing:0.02em;">
+        <span>System Resources</span>
+        <span class="section-toggle">▼</span>
+      </h3>
+      <div class="section-content">
+      <div id="system-resources-content" style="background: #1a1d24; border-radius: 8px; padding: 12px 16px; border: 1px solid #444;">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px;">
           <div style="flex: 1; min-width: 200px; display: flex; align-items: center;">
             <strong style="color: #86c6fe; font-size: 0.95em;">RAM:</strong>
@@ -770,6 +1015,13 @@ HTML = r'''
         <small id="unload-status" style="color: #8ea2be; display: none; margin-top: 8px;"></small>
       </div>
     </div>
+    </div>
+    <div class="section" id="training-output" style="margin-top: 20px;">
+      <h3 onclick="window.toggleSection && window.toggleSection('training-output')" style="margin-top:0; color: #86c6fe; font-size: 1.28em; font-weight:600; letter-spacing:0.02em;">
+        <span>Training Output</span>
+        <span class="section-toggle">▼</span>
+      </h3>
+      <div class="section-content">
     <div id="output-container" style="display:none;">
       <div class="output">
         <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
@@ -780,21 +1032,79 @@ HTML = r'''
           </div>
         </div>
         <pre id="output-text" style="max-height: 500px; overflow-y: auto; margin-top:10px;"></pre>
+        <div id="loss-chart-container" class="loss-chart-container" style="display:none;">
+          <h4>Training Loss Over Time</h4>
+          <canvas id="loss-chart-canvas"></canvas>
+        </div>
         <div id="readme-link-container" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #444;">
           <a id="readme-link" href="#" target="_blank" style="display:inline-block; padding:8px 16px; background:#7a5cff; color:#fff; text-decoration:none; border-radius:6px; font-weight:500;">
             📄 View LoRA README.md
           </a>
           <small style="display:block; color:#888; margin-top:6px;">Ready to publish on CivitAI or other platforms</small>
         </div>
+        </div>
       </div>
     </div>
     <div class="footer">
       MusubiTLX Web GUI created by TLX
       <a href="/musubitlx_gui_readme" target="_blank">GUI README</a>
+      <span id="server-info" style="margin-left: 12px; color: #666; font-size: 0.85em;"></span>
+    </div>
+    <!-- Image zoom modal -->
+    <div id="image-zoom-modal" class="image-zoom-modal" onclick="window.closeImageZoom && window.closeImageZoom()">
+      <div class="image-zoom-content" onclick="event.stopPropagation()">
+        <span class="image-zoom-close" onclick="window.closeImageZoom && window.closeImageZoom()">&times;</span>
+        <img id="zoomed-image" src="" alt="Zoomed image">
+      </div>
     </div>
   </div>
   <script>
+    // Section collapse/expand functionality
+    function toggleSection(sectionId) {
+      const section = document.getElementById(sectionId);
+      if (!section) return;
+      
+      section.classList.toggle('collapsed');
+      
+      // Save state to localStorage
+      try {
+        const collapsedSections = JSON.parse(localStorage.getItem('musubitlx_collapsed_sections') || '[]');
+        const index = collapsedSections.indexOf(sectionId);
+        
+        if (section.classList.contains('collapsed')) {
+          // Add to collapsed list if not already there
+          if (index === -1) {
+            collapsedSections.push(sectionId);
+          }
+        } else {
+          // Remove from collapsed list
+          if (index !== -1) {
+            collapsedSections.splice(index, 1);
+          }
+        }
+        
+        localStorage.setItem('musubitlx_collapsed_sections', JSON.stringify(collapsedSections));
+      } catch (err) {
+        console.warn('Failed to save section state:', err);
+      }
+    }
+    
+    function restoreSectionStates() {
+      try {
+        const collapsedSections = JSON.parse(localStorage.getItem('musubitlx_collapsed_sections') || '[]');
+        collapsedSections.forEach(sectionId => {
+          const section = document.getElementById(sectionId);
+          if (section) {
+            section.classList.add('collapsed');
+          }
+        });
+      } catch (err) {
+        console.warn('Failed to restore section states:', err);
+      }
+    }
+    
     // Make functions available globally immediately
+    window.toggleSection = toggleSection;
     window.toggleAdvancedFlags = function() {
       const panel = document.getElementById('advanced-flags-panel');
       const toggle = document.getElementById('advanced-toggle');
@@ -964,7 +1274,7 @@ HTML = r'''
       } catch (err) {
         // Silently fail for AbortError (timeout), log others
         if (err.name !== 'AbortError') {
-          console.error('Failed to fetch system resources:', err);
+        console.error('Failed to fetch system resources:', err);
         }
         const ramInfo = document.getElementById('ram-info');
         const vramInfo = document.getElementById('vram-info');
@@ -983,6 +1293,176 @@ HTML = r'''
       const container = document.getElementById('output-container');
       if (container && container.style.display !== "block") {
         container.style.display = "block";
+      }
+    }
+    
+    function initLossChart() {
+      const chartContainer = document.getElementById('loss-chart-container');
+      const canvas = document.getElementById('loss-chart-canvas');
+      if (!chartContainer || !canvas) return;
+      
+      // Destroy existing chart if it exists
+      if (lossChart) {
+        lossChart.destroy();
+        lossChart = null;
+      }
+      
+      const ctx = canvas.getContext('2d');
+      lossChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [{
+            label: 'Average Loss',
+            data: [],
+            borderColor: '#00ddcb',
+            backgroundColor: 'rgba(0, 221, 203, 0.1)',
+            borderWidth: 2,
+            pointRadius: 2,
+            pointHoverRadius: 4,
+            fill: true,
+            tension: 0.4
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              display: true,
+              labels: {
+                color: '#eee'
+              }
+            },
+            tooltip: {
+              mode: 'index',
+              intersect: false,
+              backgroundColor: 'rgba(0, 0, 0, 0.8)',
+              titleColor: '#86c6fe',
+              bodyColor: '#eee',
+              borderColor: '#00ddcb',
+              borderWidth: 1
+            }
+          },
+          scales: {
+            x: {
+              title: {
+                display: true,
+                text: 'Training Step',
+                color: '#86c6fe'
+              },
+              ticks: {
+                color: '#aaa'
+              },
+              grid: {
+                color: 'rgba(255, 255, 255, 0.1)'
+              }
+            },
+            y: {
+              title: {
+                display: true,
+                text: 'Loss',
+                color: '#86c6fe'
+              },
+              ticks: {
+                color: '#aaa'
+              },
+              grid: {
+                color: 'rgba(255, 255, 255, 0.1)'
+              },
+              beginAtZero: false
+            }
+          },
+          interaction: {
+            mode: 'nearest',
+            axis: 'x',
+            intersect: false
+          }
+        }
+      });
+      
+      chartContainer.style.display = 'block';
+    }
+    
+    function resetLossChart() {
+      lossData = {
+        steps: [],
+        losses: []
+      };
+      currentStep = 0;
+      
+      if (lossChart) {
+        lossChart.data.labels = [];
+        lossChart.data.datasets[0].data = [];
+        lossChart.update('none');
+      }
+      
+      const chartContainer = document.getElementById('loss-chart-container');
+      if (chartContainer) {
+        chartContainer.style.display = 'none';
+      }
+    }
+    
+    function parseAndUpdateLoss(data) {
+      if (!data || typeof data !== 'string') return;
+      
+      // Parse loss from progress bar format: avr_loss=0.124
+      // Also handle formats like: loss=0.123, avr_loss: 0.124, etc.
+      const lossPatterns = [
+        /avr_loss[=:]\s*([\d.]+)/i,
+        /loss[=:]\s*([\d.]+)/i
+      ];
+      
+      let lossValue = null;
+      for (const pattern of lossPatterns) {
+        const match = data.match(pattern);
+        if (match && match[1]) {
+          lossValue = parseFloat(match[1]);
+          if (!isNaN(lossValue) && isFinite(lossValue)) {
+            break;
+          }
+        }
+      }
+      
+      if (lossValue === null || isNaN(lossValue) || !isFinite(lossValue)) {
+        return;
+      }
+      
+      // Extract step number if available (e.g., "steps: 5%|▌ | 3/60")
+      const stepMatch = data.match(/steps:.*?\|.*?(\d+)\/(\d+)/);
+      if (stepMatch && stepMatch[1]) {
+        const stepNum = parseInt(stepMatch[1]);
+        if (!isNaN(stepNum)) {
+          currentStep = stepNum;
+        }
+      } else {
+        // Increment step if not found in data
+        currentStep++;
+      }
+      
+      // Initialize chart if not already done
+      if (!lossChart) {
+        initLossChart();
+      }
+      
+      // Add data point
+      lossData.steps.push(currentStep);
+      lossData.losses.push(lossValue);
+      
+      // Update chart
+      if (lossChart) {
+        lossChart.data.labels.push('Step ' + currentStep);
+        lossChart.data.datasets[0].data.push(lossValue);
+        
+        // Limit to last 500 points for performance
+        const maxPoints = 500;
+        if (lossChart.data.labels.length > maxPoints) {
+          lossChart.data.labels.shift();
+          lossChart.data.datasets[0].data.shift();
+        }
+        
+        // Update chart with animation
+        lossChart.update('none'); // 'none' for no animation (faster updates)
       }
     }
 
@@ -1072,9 +1552,16 @@ HTML = r'''
 
     function showSpinner() { 
       document.getElementById("spinner").style.display = "block";
-      document.getElementById("output-container").style.display = "block";
+      const outputContainer = document.getElementById("output-container");
+      outputContainer.style.display = "block";
+      // Reset border color to green when starting a new training
+      outputContainer.style.border = "3px solid #00ff00";
+      outputContainer.style.borderRadius = "10px";
       document.getElementById("output-text").textContent = "";
       hideReadmeLink();
+      
+      // Reset loss chart for new training
+      resetLossChart();
       const startBtn = document.getElementById("start-btn");
       const cancelBtn = document.getElementById("cancel-btn");
       const saveYamlBtn = document.getElementById("saveyaml-btn");
@@ -1198,34 +1685,351 @@ HTML = r'''
         }
         estElem.textContent = text;
     }
+    // Store currently selected files globally to preserve them when adding more
+    var storedFiles = [];
+    
+    function setupNavigation() {
+      const navLinks = document.querySelectorAll('.nav-links a');
+      const sections = {
+        'model-files': document.getElementById('model-files'),
+        'upload-images': document.getElementById('upload-images'),
+        'training-settings': document.getElementById('training-settings'),
+        'preview': document.getElementById('preview'),
+        'system-resources': document.getElementById('system-resources'),
+        'training-output': document.getElementById('training-output')
+      };
+      
+      // Smooth scroll on click
+      navLinks.forEach(link => {
+        link.addEventListener('click', function(e) {
+          const href = this.getAttribute('href');
+          if (href.startsWith('#')) {
+            const targetId = href.substring(1);
+            const targetElement = sections[targetId] || document.getElementById(targetId);
+            if (targetElement) {
+              e.preventDefault();
+              const navHeight = document.querySelector('.nav-links').offsetHeight;
+              const targetPosition = targetElement.getBoundingClientRect().top + window.pageYOffset - navHeight - 20;
+              window.scrollTo({
+                top: targetPosition,
+                behavior: 'smooth'
+              });
+            }
+          }
+        });
+      });
+      
+      // Update active state based on scroll position
+      // Use a simpler approach: find the section closest to the top of the viewport
+      function updateActiveNav() {
+        const navHeight = document.querySelector('.nav-links').offsetHeight;
+        const scrollOffset = window.pageYOffset + navHeight + 50; // Offset for sticky nav
+        
+        let activeId = null;
+        let minDistance = Infinity;
+        
+        // Check each main section
+        const mainSectionIds = ['model-files', 'upload-images', 'training-settings', 'system-resources', 'training-output'];
+        
+        mainSectionIds.forEach(sectionId => {
+          const section = sections[sectionId];
+          if (section) {
+            const rect = section.getBoundingClientRect();
+            const sectionTop = window.pageYOffset + rect.top;
+            const distance = Math.abs(sectionTop - scrollOffset);
+            
+            // If section is visible and closer to the top than previous best
+            if (rect.top < window.innerHeight && rect.bottom > 0 && distance < minDistance) {
+              minDistance = distance;
+              activeId = sectionId;
+            }
+          }
+        });
+        
+        // Special handling for preview - only if upload-images is not active
+        if (activeId !== 'upload-images') {
+          const previewElement = sections['preview'];
+          if (previewElement) {
+            const rect = previewElement.getBoundingClientRect();
+            if (rect.top < window.innerHeight && rect.bottom > 0) {
+              const previewTop = window.pageYOffset + rect.top;
+              const previewDistance = Math.abs(previewTop - scrollOffset);
+              // Only use preview if it's closer and upload-images is not the active one
+              if (previewDistance < minDistance) {
+                activeId = 'preview';
+              }
+            }
+          }
+        }
+        
+        // Update active state
+        navLinks.forEach(link => {
+          const href = link.getAttribute('href');
+          if (href === '#' + activeId) {
+            link.classList.add('active');
+          } else {
+            link.classList.remove('active');
+          }
+        });
+      }
+      
+      // Update on scroll
+      let scrollTimeout;
+      window.addEventListener('scroll', function() {
+        clearTimeout(scrollTimeout);
+        scrollTimeout = setTimeout(updateActiveNav, 50);
+      }, { passive: true });
+      
+      // Initial update
+      updateActiveNav();
+    }
+    
+    function saveDraftToStorage() {
+      try {
+        const draft = {};
+        
+        // Save all form fields
+        const fieldsToSave = [
+          'epochs', 'batch_size', 'image_repeats', 'lr', 'resolution', 'seed',
+          'rank', 'dims', 'output_dir', 'output_name', 'trigger', 'vram_profile',
+          'caption_model', 'caption_max_length', 'caption_detail_level',
+          'training_preset', 'sample_every_epochs', 'sample_every_steps',
+          'sample_prompt_text', 'advanced_flags'
+        ];
+        
+        fieldsToSave.forEach(fieldName => {
+          const input = document.querySelector(`input[name="${fieldName}"], select[name="${fieldName}"], textarea[name="${fieldName}"]`);
+          if (input) {
+            if (input.type === 'checkbox') {
+              draft[fieldName] = input.checked;
+            } else {
+              draft[fieldName] = input.value;
+            }
+          }
+        });
+        
+        // Save samples_enabled checkbox separately
+        const samplesCheckbox = document.getElementById('samples_enabled');
+        if (samplesCheckbox) {
+          draft.samples_enabled = samplesCheckbox.checked;
+        }
+        
+        // Save to localStorage
+        localStorage.setItem('musubitlx_training_draft', JSON.stringify(draft));
+        localStorage.setItem('musubitlx_draft_timestamp', new Date().toISOString());
+      } catch (err) {
+        console.warn('Failed to save draft to localStorage:', err);
+      }
+    }
+    
+    function loadDraftFromStorage() {
+      try {
+        const draftJson = localStorage.getItem('musubitlx_training_draft');
+        if (!draftJson) return;
+        
+        const draft = JSON.parse(draftJson);
+        const timestamp = localStorage.getItem('musubitlx_draft_timestamp');
+        
+        // Check if draft is recent (within last 30 days)
+        if (timestamp) {
+          const draftDate = new Date(timestamp);
+          const now = new Date();
+          const daysDiff = (now - draftDate) / (1000 * 60 * 60 * 24);
+          if (daysDiff > 30) {
+            // Draft is too old, don't load it
+            localStorage.removeItem('musubitlx_training_draft');
+            localStorage.removeItem('musubitlx_draft_timestamp');
+            return;
+          }
+        }
+        
+        // Load all saved fields
+        Object.keys(draft).forEach(fieldName => {
+          const input = document.querySelector(`input[name="${fieldName}"], select[name="${fieldName}"], textarea[name="${fieldName}"]`);
+          if (input) {
+            if (input.type === 'checkbox') {
+              input.checked = draft[fieldName] === true;
+            } else {
+              input.value = draft[fieldName] || '';
+            }
+            // Trigger input event to update dependent fields
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+        
+        // Load samples_enabled checkbox separately
+        if (draft.samples_enabled !== undefined) {
+          const samplesCheckbox = document.getElementById('samples_enabled');
+          if (samplesCheckbox) {
+            samplesCheckbox.checked = draft.samples_enabled === true;
+            samplesCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        
+        // Update dependent UI elements
+        setTimeout(function() {
+          if (typeof updateEstimate === 'function') {
+            updateEstimate();
+          }
+          if (typeof updateCommandPreview === 'function') {
+            updateCommandPreview();
+          }
+          if (typeof updatePresetDropdown === 'function') {
+            updatePresetDropdown();
+          }
+          if (typeof updateCaptionLengthLabel === 'function') {
+            updateCaptionLengthLabel();
+          }
+          if (typeof updateDetailLevelLabel === 'function') {
+            updateDetailLevelLabel();
+          }
+        }, 100);
+      } catch (err) {
+        console.warn('Failed to load draft from localStorage:', err);
+      }
+    }
+    
+    function setupAutoSave() {
+      // Save draft when any form field changes
+      const form = document.getElementById('training-form');
+      if (!form) return;
+      
+      // Debounce save to avoid too frequent saves
+      let saveTimeout;
+      function debouncedSave() {
+        clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(saveDraftToStorage, 500); // Save 500ms after last change
+      }
+      
+      // Listen to all input, change, and select events
+      form.addEventListener('input', debouncedSave);
+      form.addEventListener('change', debouncedSave);
+      
+      // Also listen to checkbox changes
+      const samplesCheckbox = document.getElementById('samples_enabled');
+      if (samplesCheckbox) {
+        samplesCheckbox.addEventListener('change', debouncedSave);
+      }
+      
+      // Save on page unload as well
+      window.addEventListener('beforeunload', function() {
+        saveDraftToStorage();
+      });
+    }
+    
+    function updateStartButtonState() {
+        const startBtn = document.getElementById('start-btn');
+        if (!startBtn) return;
+        
+        const uploadedCount = document.getElementById('uploaded_count');
+        const imageCount = uploadedCount ? parseInt(uploadedCount.value || "0") : 0;
+        
+        if (imageCount === 0) {
+            startBtn.disabled = true;
+            startBtn.style.opacity = "0.5";
+            startBtn.style.cursor = "not-allowed";
+            startBtn.title = "Please select at least one image before starting training";
+        } else {
+            startBtn.disabled = false;
+            startBtn.style.opacity = "1";
+            startBtn.style.cursor = "pointer";
+            startBtn.title = "";
+        }
+    }
+    
+    function handleFileInputChange(event) {
+        const fileInput = event.target;
+        if (!fileInput) return;
+        
+        // Get new files that were just selected (browser has already updated fileInput.files)
+        const newFiles = Array.from(fileInput.files || []);
+        
+        // Get existing files from our stored list
+        const existingFiles = storedFiles.slice();
+        
+        // Combine existing and new files (avoid duplicates)
+        const allFiles = existingFiles.slice();
+        const existingKeys = new Set(existingFiles.map(f => f.name + f.size + f.lastModified));
+        
+        for (let i = 0; i < newFiles.length; i++) {
+            const newFile = newFiles[i];
+            const fileKey = newFile.name + newFile.size + newFile.lastModified;
+            if (!existingKeys.has(fileKey)) {
+                allFiles.push(newFile);
+                existingKeys.add(fileKey);
+            }
+        }
+        
+        // Update stored files
+        storedFiles = allFiles.slice();
+        
+        // Update file input with combined files
+        const dt = new DataTransfer();
+        for (let i = 0; i < allFiles.length; i++) {
+            dt.items.add(allFiles[i]);
+        }
+        fileInput.files = dt.files;
+        
+        // Call previewImages with the combined files
+        previewImages({ target: fileInput, files: allFiles });
+    }
+    
     function previewImages(event) {
         var preview = document.getElementById('preview');
+        const fileInput = document.getElementById('images');
+        if (!fileInput) return;
+        
+        // Get files from event.files (if provided) or from fileInput.files
+        // When called from handleFileInputChange, event.files contains the combined list
+        var allFiles = event.files ? event.files : (event.target && event.target.files ? Array.from(event.target.files) : []);
+        
+        // If we got files from event, update storedFiles to match
+        if (event.files) {
+            storedFiles = Array.from(allFiles);
+        } else {
+            // Otherwise, use storedFiles (for drag & drop or other cases)
+            allFiles = storedFiles.slice();
+        }
+        
+        // Clear preview and rebuild with all files
         preview.innerHTML = '';
-        // Remove empty class when files are selected
         preview.classList.remove('imglist-empty');
-        var files = event.target && event.target.files ? event.target.files : (event.files || []);
-        document.getElementById('uploaded_count').value = files.length;
+        
+        const totalFiles = allFiles.length;
+        document.getElementById('uploaded_count').value = totalFiles;
+        
+        // Update start button state based on image count
+        updateStartButtonState();
+        
+        // Update preset values if a preset is active
+        setTimeout(function() {
+          if (typeof updatePresetValuesForImageCount === 'function') {
+            updatePresetValuesForImageCount();
+          }
+        }, 50);
         
         // Update file input status text and clear button visibility
         const statusEl = document.getElementById('file-input-status');
         const clearBtn = document.getElementById('clear-images-btn');
         if (statusEl) {
-            if (files.length === 0) {
+            if (totalFiles === 0) {
                 statusEl.textContent = "No files selected";
                 if (clearBtn) clearBtn.style.display = "none";
                 preview.classList.add('imglist-empty');
                 preview.innerHTML = '<div class="drop-hint">Drag &amp; drop images here or use the file picker above.</div>';
-            } else if (files.length === 1) {
+            } else if (totalFiles === 1) {
                 statusEl.textContent = "1 file selected";
                 if (clearBtn) clearBtn.style.display = "inline-block";
             } else {
-                statusEl.textContent = files.length + " files selected";
+                statusEl.textContent = totalFiles + " files selected";
                 if (clearBtn) clearBtn.style.display = "inline-block";
             }
         }
         
-        for (let i = 0; i < files.length; i++) {
-            let f = files[i];
+        // Render all files
+        for (let i = 0; i < allFiles.length; i++) {
+            let f = allFiles[i];
             let reader = new FileReader();
 
             // Create container and caption in the correct order immediately
@@ -1242,6 +2046,10 @@ HTML = r'''
             reader.onload = function(e) {
                 if (imgEl) {
                     imgEl.src = e.target.result;
+                    // Add click handler for zoom
+                    imgEl.addEventListener('click', function() {
+                        openImageZoom(e.target.result);
+                    });
                 }
             }
             reader.readAsDataURL(f);
@@ -1249,25 +2057,56 @@ HTML = r'''
         updateEstimate();
     }
 
+    function openImageZoom(imageSrc) {
+        const modal = document.getElementById('image-zoom-modal');
+        const img = document.getElementById('zoomed-image');
+        if (modal && img) {
+            img.src = imageSrc;
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden'; // Prevent background scrolling
+            
+            // Close on Escape key
+            const escapeHandler = function(e) {
+                if (e.key === 'Escape') {
+                    closeImageZoom();
+                    document.removeEventListener('keydown', escapeHandler);
+                }
+            };
+            document.addEventListener('keydown', escapeHandler);
+        }
+    }
+    
+    function closeImageZoom() {
+        const modal = document.getElementById('image-zoom-modal');
+        if (modal) {
+            modal.classList.remove('active');
+            document.body.style.overflow = ''; // Restore scrolling
+        }
+    }
+
     function removeImage(indexToRemove) {
         const fileInput = document.getElementById('images');
-        if (!fileInput || !fileInput.files || fileInput.files.length === 0) return;
+        if (!fileInput || storedFiles.length === 0) return;
+        
+        // Remove file from stored files
+        storedFiles.splice(indexToRemove, 1);
         
         // Create a new FileList without the removed file
         const dt = new DataTransfer();
-        const files = Array.from(fileInput.files);
-        
-        for (let i = 0; i < files.length; i++) {
-            if (i !== indexToRemove) {
-                dt.items.add(files[i]);
-            }
+        for (let i = 0; i < storedFiles.length; i++) {
+            dt.items.add(storedFiles[i]);
         }
         
         // Update file input with new FileList
         fileInput.files = dt.files;
         
         // Re-render preview with updated files
-        previewImages({ target: fileInput });
+        previewImages({ target: fileInput, files: storedFiles.slice() });
+        
+        // Update start button state
+        updateStartButtonState();
+        
+        // Note: updatePresetValuesForImageCount will be called from previewImages
     }
 
     function clearSelectedImages() {
@@ -1276,6 +2115,9 @@ HTML = r'''
         const statusEl = document.getElementById('file-input-status');
         const clearBtn = document.getElementById('clear-images-btn');
         const uploadedCount = document.getElementById('uploaded_count');
+        
+        // Clear stored files
+        storedFiles = [];
         
         if (fileInput) {
             // Clear the file input by creating a new one (old value can't be cleared directly)
@@ -1299,6 +2141,16 @@ HTML = r'''
         if (uploadedCount) {
             uploadedCount.value = "0";
         }
+        
+        // Update start button state
+        updateStartButtonState();
+        
+        // Update preset values if a preset is active
+        setTimeout(function() {
+          if (typeof updatePresetValuesForImageCount === 'function') {
+            updatePresetValuesForImageCount();
+          }
+        }, 50);
         
         updateEstimate();
     }
@@ -1395,7 +2247,7 @@ HTML = r'''
         const media =
           file.kind === "video"
             ? '<video src="' + file.url + '" muted loop playsinline></video>'
-            : '<img src="' + file.url + '" alt="' + file.name + ' thumbnail">';
+            : '<img src="' + file.url + '" alt="' + file.name + ' thumbnail" class="sample-image-zoom">';
         const timestamp = file.mtime_display || "";
         card.innerHTML = 
           '<a href="' + file.url + '" target="_blank" rel="noopener">' +
@@ -1404,6 +2256,18 @@ HTML = r'''
             '<div class="sample-card-meta" style="color:#888;">' + timestamp + '</div>' +
           '</a>';
         gallery.appendChild(card);
+        
+        // Add click handler for zoom on images (not videos)
+        if (file.kind !== "video") {
+          const img = card.querySelector('img.sample-image-zoom');
+          if (img) {
+            img.addEventListener('click', function(e) {
+              e.preventDefault();
+              e.stopPropagation();
+              openImageZoom(file.url);
+            });
+          }
+        }
       });
     }
 
@@ -1591,19 +2455,73 @@ HTML = r'''
 
       const btn = document.getElementById('autocap-btn');
       const statusEl = document.getElementById('autocap-status');
+      const progressContainer = document.getElementById('autocap-progress-container');
+      const progressBar = document.getElementById('autocap-progress-bar');
       const modelSelect = document.getElementById('caption_model');
       const selectedModelValue = modelSelect ? (modelSelect.value || 'vit-gpt2') : 'vit-gpt2';
       const runningModelName = selectedModelValue === 'qwen-vl' ? 'Qwen-VL' : 
                                selectedModelValue === 'blip-large' ? 'BLIP large' : 'ViT-GPT2';
+      
+      // Check if model is already loaded and if it's cached
+      let modelLoaded = false;
+      let modelCached = false;
+      try {
+        const statusResp = await fetch('/caption_model_status?model=' + encodeURIComponent(selectedModelValue));
+        if (statusResp.ok) {
+          const statusData = await statusResp.json();
+          modelLoaded = statusData.model_loaded || false;
+          modelCached = statusData.model_cached || false;
+        }
+      } catch (err) {
+        // Silently fail - assume model not loaded
+      }
+      
       if (btn) {
         btn.disabled = true;
         btn.textContent = "Auto-captioning with " + runningModelName + "...";
       }
 
+      const totalImages = files.length;
+      let currentImage = 0;
+      
+      // Estimated time per image (in seconds) based on model type
+      const timePerImage = {
+        'vit-gpt2': 2,
+        'blip-large': 5,
+        'qwen-vl': 10
+      };
+      const estimatedTimePerImage = timePerImage[selectedModelValue] || 3;
+      
+      // Show progress bar
+      if (progressContainer) {
+        progressContainer.style.display = "block";
+      }
+      if (progressBar) {
+        progressBar.style.width = "0%";
+      }
+
         if (statusEl) {
         autoCapStart = Date.now();
         statusEl.style.display = "block";
-        statusEl.textContent = "Preparing auto-captioning with " + runningModelName + "... If this is the first run, the model will be downloaded. Please wait.";
+        
+        // Different messages based on whether model is loaded and cached
+        let initialStatusText;
+        if (!modelLoaded) {
+          if (modelCached) {
+            // Model is cached on disk, just loading into memory
+            initialStatusText = "🔄 Loading " + runningModelName + " model from cache into memory...";
+          } else {
+            // Model not cached, will download
+            if (selectedModelValue === 'qwen-vl') {
+              initialStatusText = "📥 " + runningModelName + " model not found. Downloading from Hugging Face (~14GB, this may take 10-15 minutes)...";
+            } else {
+              initialStatusText = "📥 " + runningModelName + " model not found. Downloading from Hugging Face (first run only, this may take several minutes)...";
+            }
+          }
+        } else {
+          initialStatusText = "🔄 Loading " + runningModelName + " model into memory...";
+        }
+        statusEl.textContent = initialStatusText;
 
         if (autoCapTimer) {
           clearInterval(autoCapTimer);
@@ -1611,9 +2529,55 @@ HTML = r'''
         autoCapTimer = setInterval(() => {
           if (!autoCapStart) return;
           const elapsedSec = Math.round((Date.now() - autoCapStart) / 1000);
-          statusEl.textContent = "Caption model is working"
-            + (elapsedSec > 0 ? ' (elapsed ~' + elapsedSec + 's). First run may take several minutes while the model downloads.' : "...");
-        }, 2000);
+          
+          // Estimate progress based on elapsed time
+          // For first run: downloading can take 1-15 minutes depending on model size
+          // ViT-GPT2: ~500MB, BLIP: ~1.5GB, Qwen-VL: ~14GB
+          const downloadTime = {
+            'vit-gpt2': 60,      // ~1 minute for ~500MB
+            'blip-large': 120,   // ~2 minutes for ~1.5GB
+            'qwen-vl': 600       // ~10 minutes for ~14GB (may take 10-15 minutes depending on connection)
+          };
+          // If model is loaded, it's quick. If cached but not loaded, loading from cache is faster than downloading.
+          const modelLoadTime = modelLoaded ? 5 : (modelCached ? 10 : (downloadTime[selectedModelValue] || 60));
+          const estimatedTotalTime = modelLoadTime + (totalImages * estimatedTimePerImage);
+          
+          if (elapsedSec < modelLoadTime) {
+            // Still loading/downloading model
+            const progressPercent = Math.min(10, (elapsedSec / modelLoadTime) * 10);
+            if (progressBar) progressBar.style.width = progressPercent + "%";
+            
+            if (!modelLoaded) {
+              if (modelCached) {
+                // Model is cached, just loading from cache into memory
+                statusEl.textContent = "🔄 Loading " + runningModelName + " model from cache into memory...";
+              } else {
+                // Model is being downloaded
+                if (selectedModelValue === 'qwen-vl') {
+                  // Qwen-VL is a large file (~14GB), estimate download time
+                  const qwenVlDownloadTime = 600; // ~10 minutes for ~14GB at reasonable speeds
+                  const progressPercent = Math.min(10, (elapsedSec / qwenVlDownloadTime) * 10);
+                  if (progressBar) progressBar.style.width = progressPercent + "%";
+                  
+                  statusEl.textContent = "📥 Downloading " + runningModelName + " model (~14GB) from Hugging Face... This may take 10-15 minutes depending on your connection speed.";
+                } else {
+                  statusEl.textContent = "📥 Downloading " + runningModelName + " model (" + (selectedModelValue === 'vit-gpt2' ? '~500MB' : '~1.5GB') + ") from Hugging Face... This only happens on first run.";
+                }
+              }
+            } else {
+              // Model already loaded in memory
+              statusEl.textContent = "🔄 Loading " + runningModelName + " model into memory...";
+            }
+          } else {
+            // Processing images - show clear progress
+            const processingTime = elapsedSec - modelLoadTime;
+            currentImage = Math.min(totalImages - 1, Math.floor(processingTime / estimatedTimePerImage));
+            const progress = Math.min(95, 10 + ((currentImage + 1) / totalImages) * 85);
+            
+            if (progressBar) progressBar.style.width = progress + "%";
+            statusEl.textContent = "✨ Writing caption for image " + (currentImage + 1) + " of " + totalImages + " with " + runningModelName + "...";
+          }
+        }, 500); // Update every 500ms for smoother progress
       }
 
       try {
@@ -1672,11 +2636,17 @@ HTML = r'''
 
         if (statusEl) {
           const count = data.captions.length;
-          statusEl.textContent = 'Auto-captioning finished successfully for ' + count + ' image(s).';
+          statusEl.textContent = '✅ Auto-captioning finished successfully for ' + count + ' image(s).';
+        }
+        if (progressBar) {
+          progressBar.style.width = "100%";
         }
       } catch (err) {
         console.error(err);
-        if (statusEl) statusEl.textContent = "Autocaption request failed: " + err.message;
+        if (statusEl) statusEl.textContent = "❌ Autocaption request failed: " + err.message;
+        if (progressBar) {
+          progressBar.style.width = "0%";
+        }
       } finally {
         if (autoCapTimer) {
           clearInterval(autoCapTimer);
@@ -1687,6 +2657,13 @@ HTML = r'''
           btn.disabled = false;
           btn.textContent = "Auto-caption images";
         }
+        // Hide progress bar after 3 seconds
+        setTimeout(() => {
+          const progressContainer = document.getElementById('autocap-progress-container');
+          if (progressContainer) {
+            progressContainer.style.display = "none";
+          }
+        }, 3000);
       }
     }
 
@@ -1713,11 +2690,33 @@ HTML = r'''
           const dtFiles = e.dataTransfer && e.dataTransfer.files ? Array.from(e.dataTransfer.files) : [];
           const imageFiles = dtFiles.filter(f => f.type.startsWith('image/'));
           if (!imageFiles.length) return;
+          
+          // Get existing files from storedFiles
+          const existingFiles = storedFiles.slice();
+          const existingNames = new Set(existingFiles.map(f => f.name + f.size + f.lastModified));
+          
+          // Add only new files (avoid duplicates)
+          const allFiles = existingFiles.slice();
+          imageFiles.forEach(f => {
+            const fileKey = f.name + f.size + f.lastModified;
+            if (!existingNames.has(fileKey)) {
+              allFiles.push(f);
+              existingNames.add(fileKey);
+            }
+          });
+          
+          // Update stored files
+          storedFiles = allFiles.slice();
+          
+          // Update file input
           const dt = new DataTransfer();
-          Array.from(fileInput.files || []).forEach(f => dt.items.add(f));
-          imageFiles.forEach(f => dt.items.add(f));
+          allFiles.forEach(f => dt.items.add(f));
           fileInput.files = dt.files;
-          previewImages({ target: fileInput });
+          
+          previewImages({ target: fileInput, files: allFiles });
+          
+          // Update start button state (previewImages will also call it, but this ensures it happens)
+          updateStartButtonState();
         });
     }
     
@@ -1726,6 +2725,14 @@ HTML = r'''
     let sseBuffer = "";
     let lastSseFlush = 0;
     const SSE_FLUSH_INTERVAL_MS = 1000; // flush to UI every 1 second for responsive updates
+    
+    // Loss chart tracking
+    let lossChart = null;
+    let lossData = {
+      steps: [],
+      losses: []
+    };
+    let currentStep = 0;
     
     // Auto-refresh sample gallery during training
     let sampleGalleryPollInterval = null;
@@ -1773,11 +2780,35 @@ HTML = r'''
 
     function openLogStream() {
       ensureOutputVisible();
-      if (eventSource) eventSource.close();
+      
+      // Close any existing eventSource before opening a new one
+      // Store reference to avoid race conditions
+      const oldEventSource = eventSource;
+      if (oldEventSource) {
+        try {
+          oldEventSource.close();
+        } catch (e) {
+          // Ignore errors when closing old connection
+        }
+        eventSource = null;
+      }
+      
+      // Clear buffer when starting a new stream
+      sseBuffer = "";
+      lastSseFlush = 0;
+      
+      // Create new EventSource connection
       eventSource = new EventSource('/stream');
       
       eventSource.onmessage = function(event) {
+        // Check if eventSource was closed/cancelled while processing
+        if (!eventSource || eventSource !== this) {
+          return;
+        }
+        
         const outputText = document.getElementById("output-text");
+        if (!outputText) return;
+        
         const data = event.data;
         
         if (!data || data.trim() === "") {
@@ -1788,36 +2819,66 @@ HTML = r'''
         if (data.includes("[SSE_RECONNECT]")) {
           // Silently reconnect without showing anything to user
           setTimeout(function() {
-            openLogStream();
+            if (eventSource && eventSource.readyState !== EventSource.CLOSED) {
+              openLogStream();
+            }
           }, 500);
           return;
         }
         
+        // Handle training errors
         if (data.includes("TRAINING ABORTED WITH ERROR") || data.includes("torch.OutOfMemoryError")) {
           document.getElementById("spinner").style.display = "none";
           stopSampleGalleryPolling();
-          if (eventSource) {
-            eventSource.close();
+          const currentEventSource = eventSource;
+          if (currentEventSource) {
+            try {
+              currentEventSource.close();
+            } catch (e) {
+              // Ignore errors
+            }
             eventSource = null;
           }
           enableAllButtons();
           const outputContainer = document.getElementById("output-container");
+          if (outputContainer) {
           outputContainer.style.border = "3px solid #ff5555";
           outputContainer.style.borderRadius = "10px";
+          }
+          
+          // Final update of loss chart
+          if (lossChart) {
+            lossChart.update();
+          }
+          
           refreshSampleGallery(true);
+          return;
         }
         
+        // Handle training completion
         if (data.includes("[TRAINING_FINISHED]")) {
           document.getElementById("spinner").style.display = "none";
           stopSampleGalleryPolling();
-          if (eventSource) {
-            eventSource.close();
+          const currentEventSource = eventSource;
+          if (currentEventSource) {
+            try {
+              currentEventSource.close();
+            } catch (e) {
+              // Ignore errors
+            }
             eventSource = null;
           }
           enableAllButtons();
           const outputContainer = document.getElementById("output-container");
+          if (outputContainer) {
           outputContainer.style.border = "3px solid #00ff00";
           outputContainer.style.borderRadius = "10px";
+          }
+          
+          // Final update of loss chart
+          if (lossChart) {
+            lossChart.update();
+          }
           
           // Show README link if available
           refreshReadmeLink();
@@ -1826,12 +2887,25 @@ HTML = r'''
           return;
         }
         
+        // Parse loss values from data and update chart
+        parseAndUpdateLoss(data);
+        
+        // Buffer and display regular log data
         const processedData = data + "\n";
         sseBuffer += processedData;
         const now = Date.now();
-        if (!lastSseFlush || (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || data.includes("TRAINING ABORTED WITH ERROR") || data.includes("✅ TRAINING COMPLETED!") || data.includes("LoRA README generated")) {
+        
+        // Flush buffer if interval elapsed or important message received
+        if (!lastSseFlush || 
+            (now - lastSseFlush) >= SSE_FLUSH_INTERVAL_MS || 
+            data.includes("TRAINING ABORTED WITH ERROR") || 
+            data.includes("✅ TRAINING COMPLETED!") || 
+            data.includes("LoRA README generated")) {
+          
+          if (outputText) {
           outputText.textContent += sseBuffer;
           outputText.scrollTop = outputText.scrollHeight;
+          }
           
           // Check if README was generated and show link
           if (sseBuffer.includes("LoRA README generated")) {
@@ -1844,21 +2918,202 @@ HTML = r'''
       };
       
       eventSource.onerror = function(event) {
-        // Auto-reconnect on error (common with Waitress)
-        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+        // Auto-reconnect on error (common with Waitress/gevent)
+        const currentEventSource = eventSource;
+        if (currentEventSource && currentEventSource.readyState === EventSource.CLOSED) {
           const spinner = document.getElementById("spinner");
+          // Only reconnect if training is still active
           if (spinner && spinner.style.display === "block") {
-            // Training is active, try to reconnect
+            // Training is active, try to reconnect after a delay
             setTimeout(function() {
-              openLogStream();
+              // Double-check training is still active before reconnecting
+              const spinnerCheck = document.getElementById("spinner");
+              if (spinnerCheck && spinnerCheck.style.display === "block" && !eventSource) {
+                openLogStream();
+              }
             }, 1000);
           }
         }
       };
     }
 
+    function validateTrainingForm() {
+      const errors = [];
+      
+      // Check for images
+      const uploadedCount = document.getElementById('uploaded_count');
+      const imageCount = uploadedCount ? parseInt(uploadedCount.value || "0") : 0;
+      if (imageCount === 0) {
+        errors.push("No training images selected. Please upload at least one image.");
+      }
+      
+      // Check required fields
+      const epochsInput = document.querySelector('input[name="epochs"]');
+      const epochs = epochsInput ? parseInt(epochsInput.value || "0") : 0;
+      if (!epochs || epochs <= 0) {
+        errors.push("Epochs must be greater than 0.");
+        if (epochsInput) epochsInput.classList.add('field-error');
+      } else if (epochsInput) {
+        epochsInput.classList.remove('field-error');
+      }
+      
+      const lrInput = document.querySelector('input[name="lr"]');
+      const lr = lrInput ? (lrInput.value || "").trim() : "";
+      if (!lr) {
+        errors.push("Learning rate is required.");
+        if (lrInput) lrInput.classList.add('field-error');
+      } else {
+        // Validate learning rate format (should be like "1e-4" or "0.0001")
+        const lrMatch = lr.match(/^[\d.]+(e-?\d+)?$/i);
+        if (!lrMatch) {
+          errors.push("Learning rate format is invalid. Use format like '1e-4' or '0.0001'.");
+          if (lrInput) lrInput.classList.add('field-error');
+        } else if (lrInput) {
+          lrInput.classList.remove('field-error');
+        }
+      }
+      
+      const rankInput = document.querySelector('input[name="rank"]');
+      const rank = rankInput ? parseInt(rankInput.value || "0") : 0;
+      if (!rank || rank <= 0) {
+        errors.push("LoRA rank must be greater than 0.");
+        if (rankInput) rankInput.classList.add('field-error');
+      } else if (rankInput) {
+        rankInput.classList.remove('field-error');
+      }
+      
+      const dimsInput = document.querySelector('input[name="dims"]');
+      const dims = dimsInput ? parseInt(dimsInput.value || "0") : 0;
+      if (!dims || dims <= 0) {
+        errors.push("LoRA dims (alpha) must be greater than 0.");
+        if (dimsInput) dimsInput.classList.add('field-error');
+      } else if (dims < rank) {
+        errors.push("LoRA dims (alpha) should be greater than or equal to LoRA rank. Recommended: dims = rank * 2.");
+        if (dimsInput) dimsInput.classList.add('field-error');
+      } else if (dimsInput) {
+        dimsInput.classList.remove('field-error');
+      }
+      
+      const resolutionInput = document.querySelector('input[name="resolution"]');
+      const resolution = resolutionInput ? (resolutionInput.value || "").trim() : "";
+      if (!resolution) {
+        errors.push("Resolution is required (e.g., '1024x1024').");
+        if (resolutionInput) resolutionInput.classList.add('field-error');
+      } else {
+        // Validate resolution format
+        const resMatch = resolution.match(/^\d+\s*x\s*\d+$/i);
+        if (!resMatch) {
+          errors.push("Resolution format is invalid. Use format like '1024x1024'.");
+          if (resolutionInput) resolutionInput.classList.add('field-error');
+        } else if (resolutionInput) {
+          resolutionInput.classList.remove('field-error');
+        }
+      }
+      
+      const batchSizeInput = document.querySelector('input[name="batch_size"]');
+      const batchSize = batchSizeInput ? parseInt(batchSizeInput.value || "0") : 0;
+      if (!batchSize || batchSize <= 0) {
+        errors.push("Batch size must be greater than 0.");
+        if (batchSizeInput) batchSizeInput.classList.add('field-error');
+      } else if (batchSizeInput) {
+        batchSizeInput.classList.remove('field-error');
+      }
+      
+      return errors;
+    }
+    
+    function showValidationErrors(errors) {
+      // Remove any existing validation error box
+      const existingError = document.getElementById('validation-error-box');
+      if (existingError) {
+        existingError.remove();
+      }
+      
+      // Create error box
+      const errorBox = document.createElement('div');
+      errorBox.id = 'validation-error-box';
+      errorBox.className = 'validation-error';
+      errorBox.style.display = 'block';
+      errorBox.style.zIndex = '1000';
+      errorBox.innerHTML = '<h4>⚠️ Cannot start training - Please fix the following issues:</h4><ul>' +
+        errors.map(err => '<li>' + err + '</li>').join('') +
+        '</ul>';
+      
+      // Try to insert before the start button's parent container
+      const startBtn = document.getElementById('start-btn');
+      if (startBtn) {
+        // Find the button row or parent container
+        let container = startBtn.parentNode;
+        // If it's a div with class button-row, use that, otherwise use parent
+        if (container && container.classList && container.classList.contains('button-row')) {
+          container.insertBefore(errorBox, startBtn);
+        } else {
+          // Insert before the button row or start button
+          if (container) {
+            container.insertBefore(errorBox, startBtn);
+          } else {
+            // Fallback: insert at the end of training-settings section
+            const trainingSettings = document.getElementById('training-settings');
+            if (trainingSettings) {
+              trainingSettings.appendChild(errorBox);
+            }
+          }
+        }
+        
+        // Scroll to error box after a short delay to ensure it's rendered
+        setTimeout(function() {
+          errorBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
+      } else {
+        // Fallback: insert at the end of training-settings section
+        const trainingSettings = document.getElementById('training-settings');
+        if (trainingSettings) {
+          trainingSettings.appendChild(errorBox);
+          setTimeout(function() {
+            errorBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 100);
+        }
+      }
+      
+      // Also show an alert for immediate feedback
+      alert('⚠️ Cannot start training!\n\nPlease fix the following issues:\n\n' + errors.join('\n'));
+    }
+    
     function startTraining() {
+      // Validate form first
+      const errors = validateTrainingForm();
+      if (errors.length > 0) {
+        showValidationErrors(errors);
+        return;
+      }
+      
+      // Remove any existing validation error box
+      const existingError = document.getElementById('validation-error-box');
+      if (existingError) {
+        existingError.remove();
+      }
+      
+      // Show confirmation dialog
+      const confirmStart = window.confirm(
+        "Are you sure you want to start training?\n\n" +
+        "This will begin the training process with your current settings.\n" +
+        "Training can take a long time depending on your configuration.\n\n" +
+        "Click OK to start training, or Cancel to review your settings."
+      );
+      
+      if (!confirmStart) {
+        return;
+      }
+      
       showSpinner();
+      
+      // Ensure any existing eventSource is closed before opening a new one
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+      
+      // Open log stream to receive training updates
       openLogStream();
       
       // Start auto-refreshing sample gallery during training
@@ -1880,11 +3135,19 @@ HTML = r'''
         if (!response.ok) {
             document.getElementById("output-text").textContent += "❌ Server error when starting training: " + response.statusText + "\n";
             stopSampleGalleryPolling();
+            if (eventSource) {
+              eventSource.close();
+              eventSource = null;
+            }
         }
       })
       .catch(error => {
             document.getElementById("output-text").textContent += "❌ Network error when starting training: " + error + "\n";
             stopSampleGalleryPolling();
+            if (eventSource) {
+              eventSource.close();
+              eventSource = null;
+            }
       });
     }
 
@@ -1892,21 +3155,72 @@ HTML = r'''
       const confirmCancel = window.confirm("Are you sure you want to cancel the current training run?");
       if (!confirmCancel) return;
       stopSampleGalleryPolling();
+      
+      // Immediately show cancel message in console
+      const outputText = document.getElementById("output-text");
+      const outputContainer = document.getElementById("output-container");
+      if (outputContainer) {
+        outputContainer.style.display = "block";
+      }
+      if (outputText) {
+        outputText.textContent += "\n" + "=".repeat(60) + "\n";
+        outputText.textContent += "⏹ TRAINING CANCEL REQUEST RECEIVED. Attempting to stop processes...\n";
+        outputText.textContent += "Unloading models from VRAM/RAM...\n";
+        outputText.textContent += "=".repeat(60) + "\n";
+        outputText.scrollTop = outputText.scrollHeight;
+      }
+      
       const statusEl = document.getElementById('autocap-status');
       try {
         const resp = await fetch('/cancel_training', { method: 'POST' });
         if (!resp.ok) {
           const text = await resp.text();
           if (statusEl) statusEl.textContent = "Cancel request failed: " + text;
+          if (outputText) {
+            outputText.textContent += "❌ Cancel request failed: " + text + "\n";
+            outputText.scrollTop = outputText.scrollHeight;
+          }
           return;
         }
-        if (statusEl) statusEl.textContent = "Training cancel request sent. Waiting for processes to stop...";
+        
+        // Read response message
+        const result = await resp.json();
+        const successMessage = result.message || "Training canceled. Processes stopped.";
+        
+        if (statusEl) statusEl.textContent = successMessage;
+        
+        // Show success message in console
+        if (outputText) {
+          outputText.textContent += "✅ " + successMessage + "\n";
+          outputText.textContent += "=".repeat(60) + "\n";
+          outputText.scrollTop = outputText.scrollHeight;
+        }
+        
+        // Update UI to show training is finished
+        document.getElementById("spinner").style.display = "none";
+        stopSampleGalleryPolling();
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        enableAllButtons();
+        if (outputContainer) {
+          outputContainer.style.border = "3px solid #ff5555";
+          outputContainer.style.borderRadius = "10px";
+        }
       } catch (err) {
         if (statusEl) statusEl.textContent = "Cancel request error: " + err;
+        if (outputText) {
+          outputText.textContent += "❌ Cancel request error: " + err + "\n";
+          outputText.scrollTop = outputText.scrollHeight;
+        }
       }
     }
     
     // Make ALL functions available globally for inline handlers - MUST be after all function definitions
+    window.openImageZoom = openImageZoom;
+    window.closeImageZoom = closeImageZoom;
+    window.handleFileInputChange = handleFileInputChange;
     window.clearSelectedImages = clearSelectedImages;
     window.previewImages = previewImages;
     window.removeImage = removeImage;
@@ -1925,6 +3239,377 @@ HTML = r'''
     window.renderSampleGallery = renderSampleGallery;
     window.computeFinalOutputDir = computeFinalOutputDir;
     window.markSampleGalleryPending = markSampleGalleryPending;
+    window.applyTrainingPreset = applyTrainingPreset;
+    window.updatePresetDropdown = updatePresetDropdown;
+    window.updatePresetValuesForImageCount = updatePresetValuesForImageCount;
+    
+    // Preset configurations
+    // Updated according to best practices for LoRA training
+    const presetConfigs = {
+      'fast': {
+        epochs: 2,
+        batch_size: 1,
+        image_repeats: 8,
+        lr: '5e-5',
+        rank: 16,
+        dims: 16
+      },
+      'balanced': {
+        epochs: 3,
+        batch_size: 1,
+        image_repeats: 6,
+        lr: '4e-5',
+        rank: 32,
+        dims: 32
+      },
+      'high-quality': {
+        epochs: 4,
+        batch_size: 1,
+        image_repeats: 5,
+        lr: '3e-5',
+        rank: 64,
+        dims: 32
+      },
+      'person': {
+        epochs: 3,
+        batch_size: 1,
+        image_repeats: 7,
+        lr: '5e-5',
+        rank: 32,
+        dims: 32
+      },
+      'style': {
+        epochs: 4,
+        batch_size: 1,
+        image_repeats: 5,
+        lr: '2e-5',
+        rank: 16,
+        dims: 8
+      },
+      'few-images': {
+        epochs: 5,
+        batch_size: 1,
+        image_repeats: 10,
+        lr: '2e-5',
+        rank: 16,
+        dims: 16
+      },
+      'many-images': {
+        epochs: 3,
+        batch_size: 1,
+        image_repeats: 2,
+        lr: '5e-5',
+        rank: 64,
+        dims: 32
+      }
+    };
+    
+    // Check if current form values match a preset
+    // Note: We match on fixed values (lr, rank, dims, batch_size) and ignore epochs/repeats
+    // since those are dynamically adjusted based on image count
+    function detectCurrentPreset() {
+      const batchSizeInput = document.querySelector('input[name="batch_size"]');
+      const lrInput = document.querySelector('input[name="lr"]');
+      const rankInput = document.querySelector('input[name="rank"]');
+      const dimsInput = document.querySelector('input[name="dims"]');
+      
+      if (!batchSizeInput || !lrInput || !rankInput || !dimsInput) {
+        return 'custom';
+      }
+      
+      const currentValues = {
+        batch_size: parseInt(batchSizeInput.value) || 0,
+        lr: (lrInput.value || '').trim(),
+        rank: parseInt(rankInput.value) || 0,
+        dims: parseInt(dimsInput.value) || 0
+      };
+      
+      // Check each preset to see if fixed values match
+      // We ignore epochs and image_repeats since they're dynamically adjusted
+      for (const [presetName, presetConfig] of Object.entries(presetConfigs)) {
+        if (currentValues.batch_size === presetConfig.batch_size &&
+            currentValues.lr === presetConfig.lr &&
+            currentValues.rank === presetConfig.rank &&
+            currentValues.dims === presetConfig.dims) {
+          return presetName;
+        }
+      }
+      
+      return 'custom';
+    }
+    
+    // Calculate dynamic image_repeats and epochs based on number of images
+    // Also adjusts learning rate for small/large datasets
+    function calculateDynamicRepeatsAndEpochs(preset, baseEpochs, baseRepeats, baseLr, imageCount) {
+      let adjustedEpochs = baseEpochs;
+      let adjustedRepeats = baseRepeats;
+      let adjustedLr = baseLr;
+      
+      if (imageCount <= 0) {
+        // No images, use base values
+        return { epochs: adjustedEpochs, repeats: adjustedRepeats, lr: adjustedLr };
+      }
+      
+      // Convert LR string to number for calculations
+      let lrValue = parseFloat(baseLr);
+      if (isNaN(lrValue)) {
+        // Try to parse scientific notation
+        const match = baseLr.match(/([\d.]+)e-?(\d+)/i);
+        if (match) {
+          lrValue = parseFloat(match[1]) * Math.pow(10, -parseInt(match[2]));
+        } else {
+          lrValue = 5e-5; // Default fallback
+        }
+      }
+      
+      // Adjust based on image count
+      if (imageCount < 20) {
+        // Very few images: high repeats, more epochs, lower LR to prevent overfitting
+        adjustedEpochs = Math.round(baseEpochs * 1.5);
+        adjustedRepeats = Math.round(baseRepeats * 2.0);
+        lrValue = lrValue * 0.5;
+      } else if (imageCount < 50) {
+        // Few images: moderate-high repeats, moderate epochs, slightly lower LR
+        adjustedEpochs = Math.round(baseEpochs * 1.2);
+        adjustedRepeats = Math.round(baseRepeats * 1.3);
+        lrValue = lrValue * 0.7;
+      } else if (imageCount < 100) {
+        // Medium images: use base preset values
+        adjustedEpochs = baseEpochs;
+        adjustedRepeats = baseRepeats;
+        // Keep base learning rate
+      } else if (imageCount < 300) {
+        // Many images: lower repeats, fewer epochs
+        adjustedEpochs = Math.round(baseEpochs * 0.8);
+        adjustedRepeats = Math.round(baseRepeats * 0.5);
+        // Keep base learning rate
+      } else {
+        // Very many images (300+): low repeats, fewer epochs, slightly higher LR
+        adjustedEpochs = Math.round(baseEpochs * 0.6);
+        adjustedRepeats = Math.round(baseRepeats * 0.3);
+        lrValue = lrValue * 1.2;
+      }
+      
+      // Special handling for "few-images" and "many-images" presets
+      if (preset === 'few-images') {
+        // This preset is specifically for few images, ensure minimum 50 total repeats
+        const totalRepeats = imageCount * adjustedRepeats * adjustedEpochs;
+        if (totalRepeats < 50) {
+          // Adjust repeats to reach minimum 50 total repeats
+          adjustedRepeats = Math.max(10, Math.ceil(50 / (imageCount * adjustedEpochs)));
+        }
+      } else if (preset === 'many-images') {
+        // This preset is specifically for many images, keep low repeats
+        adjustedRepeats = Math.max(2, Math.min(4, adjustedRepeats));
+        adjustedEpochs = Math.max(2, Math.min(5, adjustedEpochs));
+      }
+      
+      // Critical check for Character/Person preset
+      // Characters need ~40-60 total lookups per image to learn likeness
+      if (preset === 'person') {
+        const totalRepeats = imageCount * adjustedRepeats * adjustedEpochs;
+        const targetTotalRepeats = 50; // Target 50 total repeats minimum
+        if (totalRepeats < 40) {
+          // Adjust repeats to reach target total repeats
+          adjustedRepeats = Math.max(1, Math.ceil(targetTotalRepeats / (imageCount * adjustedEpochs)));
+        }
+        // Ensure we're in the 50-60 range for optimal likeness learning
+        const finalTotalRepeats = imageCount * adjustedRepeats * adjustedEpochs;
+        if (finalTotalRepeats > 60) {
+          // Slightly reduce if we're over 60
+          adjustedRepeats = Math.max(1, Math.floor(60 / (imageCount * adjustedEpochs)));
+        }
+      }
+      
+      // Convert LR back to string format (e.g., "5e-5" not "1.0e-5")
+      // Use the same format as the original presets
+      let lrString = baseLr; // Default to original format
+      const baseLrValue = parseFloat(baseLr);
+      if (isNaN(baseLrValue)) {
+        // Try to parse scientific notation
+        const match = baseLr.match(/([\d.]+)e-?(\d+)/i);
+        if (match) {
+          const baseLrParsed = parseFloat(match[1]) * Math.pow(10, -parseInt(match[2]));
+          if (Math.abs(lrValue - baseLrParsed) > 0.0000001) {
+            // LR was adjusted, convert to scientific notation in compact format
+            const exponent = Math.floor(Math.log10(lrValue));
+            const mantissa = lrValue / Math.pow(10, exponent);
+            // Use integer mantissa if possible (e.g., "5e-5" instead of "1.0e-5")
+            if (Math.abs(mantissa - Math.round(mantissa)) < 0.01) {
+              lrString = Math.round(mantissa) + 'e-' + Math.abs(exponent);
+            } else {
+              // Round to 1 decimal place and remove trailing zero
+              const rounded = parseFloat(mantissa.toFixed(1));
+              lrString = rounded + 'e-' + Math.abs(exponent);
+            }
+          }
+        }
+      } else if (Math.abs(lrValue - baseLrValue) > 0.0000001) {
+        // LR was adjusted, convert to scientific notation in compact format
+        const exponent = Math.floor(Math.log10(lrValue));
+        const mantissa = lrValue / Math.pow(10, exponent);
+        // Use integer mantissa if possible (e.g., "5e-5" instead of "1.0e-5")
+        if (Math.abs(mantissa - Math.round(mantissa)) < 0.01) {
+          lrString = Math.round(mantissa) + 'e-' + Math.abs(exponent);
+        } else {
+          // Round to 1 decimal place and remove trailing zero
+          const rounded = parseFloat(mantissa.toFixed(1));
+          lrString = rounded + 'e-' + Math.abs(exponent);
+        }
+      }
+      
+      return { epochs: adjustedEpochs, repeats: adjustedRepeats, lr: lrString };
+    }
+    
+    // Training preset function - applies preset values to form fields
+    function applyTrainingPreset() {
+      const presetSelect = document.getElementById('training-preset');
+      if (!presetSelect) return;
+      const preset = presetSelect.value;
+      
+      // If custom, don't change anything, but update dropdown to show detected preset
+      if (preset === 'custom') {
+        const detectedPreset = detectCurrentPreset();
+        if (detectedPreset !== 'custom' && presetSelect.value === 'custom') {
+          // Don't change if user explicitly selected custom
+          return;
+        }
+        return;
+      }
+      
+      // Get number of uploaded images
+      const uploadedCountEl = document.getElementById('uploaded_count');
+      const imageCount = uploadedCountEl ? parseInt(uploadedCountEl.value || "0") : 0;
+      
+      // Get form fields
+      const epochsInput = document.querySelector('input[name="epochs"]');
+      const batchSizeInput = document.querySelector('input[name="batch_size"]');
+      const imageRepeatsInput = document.querySelector('input[name="image_repeats"]');
+      const lrInput = document.querySelector('input[name="lr"]');
+      const rankInput = document.querySelector('input[name="rank"]');
+      const dimsInput = document.querySelector('input[name="dims"]');
+      
+      const presetConfig = presetConfigs[preset];
+      if (!presetConfig) return;
+      
+      // Calculate dynamic repeats, epochs, and learning rate based on image count
+      const dynamic = calculateDynamicRepeatsAndEpochs(
+        preset,
+        presetConfig.epochs,
+        presetConfig.image_repeats,
+        presetConfig.lr,
+        imageCount
+      );
+      
+      // Temporarily disable preset detection to avoid feedback loop
+      let presetDetectionDisabled = true;
+      
+      // Apply preset values with dynamic adjustments
+      if (epochsInput) epochsInput.value = dynamic.epochs;
+      if (batchSizeInput) batchSizeInput.value = presetConfig.batch_size;
+      if (imageRepeatsInput) imageRepeatsInput.value = dynamic.repeats;
+      if (lrInput) lrInput.value = dynamic.lr; // Use dynamically adjusted LR
+      if (rankInput) rankInput.value = presetConfig.rank;
+      if (dimsInput) dimsInput.value = presetConfig.dims;
+      
+      // Ensure dropdown shows the selected preset
+      presetSelect.value = preset;
+      
+      // Trigger update events to refresh estimates and command preview
+      if (epochsInput) {
+        epochsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (batchSizeInput) {
+        batchSizeInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (imageRepeatsInput) {
+        imageRepeatsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (lrInput) {
+        lrInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (rankInput) {
+        rankInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (dimsInput) {
+        dimsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      
+      presetDetectionDisabled = false;
+      
+      // Update estimate and command preview
+      if (typeof updateEstimate === 'function') {
+        updateEstimate();
+      }
+      if (typeof updateCommandPreview === 'function') {
+        updateCommandPreview();
+      }
+    }
+    
+    // Update preset dropdown based on current values
+    function updatePresetDropdown() {
+      const presetSelect = document.getElementById('training-preset');
+      if (!presetSelect) return;
+      
+      const detectedPreset = detectCurrentPreset();
+      if (presetSelect.value !== detectedPreset) {
+        presetSelect.value = detectedPreset;
+      }
+    }
+    
+    // Update preset values (epochs and repeats) when image count changes
+    // This is called when images are added/removed and a preset is active
+    function updatePresetValuesForImageCount() {
+      const presetSelect = document.getElementById('training-preset');
+      if (!presetSelect || presetSelect.value === 'custom') {
+        return; // Don't update if custom is selected
+      }
+      
+      const preset = presetSelect.value;
+      const presetConfig = presetConfigs[preset];
+      if (!presetConfig) return;
+      
+      // Get current number of images
+      const uploadedCountEl = document.getElementById('uploaded_count');
+      const imageCount = uploadedCountEl ? parseInt(uploadedCountEl.value || "0") : 0;
+      
+      // Calculate dynamic repeats, epochs, and learning rate
+      const dynamic = calculateDynamicRepeatsAndEpochs(
+        preset,
+        presetConfig.epochs,
+        presetConfig.image_repeats,
+        presetConfig.lr,
+        imageCount
+      );
+      
+      // Update epochs, repeats, and learning rate
+      const epochsInput = document.querySelector('input[name="epochs"]');
+      const imageRepeatsInput = document.querySelector('input[name="image_repeats"]');
+      const lrInput = document.querySelector('input[name="lr"]');
+      
+      if (epochsInput && parseInt(epochsInput.value) !== dynamic.epochs) {
+        epochsInput.value = dynamic.epochs;
+        epochsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      
+      if (imageRepeatsInput && parseInt(imageRepeatsInput.value) !== dynamic.repeats) {
+        imageRepeatsInput.value = dynamic.repeats;
+        imageRepeatsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      
+      if (lrInput && lrInput.value !== dynamic.lr) {
+        lrInput.value = dynamic.lr;
+        lrInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      
+      // Update estimate and command preview
+      if (typeof updateEstimate === 'function') {
+        updateEstimate();
+      }
+      if (typeof updateCommandPreview === 'function') {
+        updateCommandPreview();
+      }
+    }
     
     // Initialize page when DOM is ready
     let initDone = false;
@@ -1932,19 +3617,31 @@ HTML = r'''
       if (initDone) return;
       initDone = true;
       
+      // Update start button state on page load
+      updateStartButtonState();
+      
+      // Load saved draft from localStorage
+      loadDraftFromStorage();
+      
+      // Setup auto-save to localStorage
+      setupAutoSave();
+      
+      // Setup smooth scroll and active state for navigation
+      setupNavigation();
+      
+      // Restore collapsed section states from localStorage
+      restoreSectionStates();
+      
       // Start system resources monitoring with delay to avoid blocking
-      // Pause polling during training to reduce server load
+      // Update more frequently during training (when it's most important)
       let resourcePollInterval = null;
       function startResourcePolling() {
         if (resourcePollInterval) return;
         resourcePollInterval = setInterval(function() {
-          // Skip polling if training is active (spinner visible)
-          const spinner = document.getElementById("spinner");
-          if (spinner && spinner.style.display === "block") return;
           if (typeof updateSystemResources === 'function') {
-            updateSystemResources();
+        updateSystemResources();
           }
-        }, 15000); // 15 seconds
+        }, 3000); // 3 seconds - more frequent updates for better live feedback
       }
       setTimeout(function() {
         try {
@@ -1952,18 +3649,18 @@ HTML = r'''
             updateSystemResources(); // Initial update
             startResourcePolling();
           }
-        } catch (err) {
-          console.error('Failed to initialize system resources monitoring:', err);
-        }
+      } catch (err) {
+        console.error('Failed to initialize system resources monitoring:', err);
+      }
       }, 500);
       
       try {
         // Safely check for spinner and start training if needed
-        try {
-          const spinner = document.getElementById("spinner");
+      try {
+        const spinner = document.getElementById("spinner");
           if (spinner && spinner.style.display === "block" && typeof startTraining === 'function') {
-            startTraining();
-          }
+          startTraining();
+        }
         } catch (err) {
           console.error('Error checking spinner:', err);
         }
@@ -1971,7 +3668,7 @@ HTML = r'''
         // Setup dropzone
         try {
           if (typeof setupDropzone === 'function') {
-            setupDropzone();
+        setupDropzone();
           }
         } catch (err) {
           console.error('Error setting up dropzone:', err);
@@ -1981,23 +3678,41 @@ HTML = r'''
         const advancedToggleBtn = document.getElementById('advanced-toggle');
         if (advancedToggleBtn) {
           advancedToggleBtn.onclick = function() {
-            window.toggleAdvancedFlags();
+              window.toggleAdvancedFlags();
           };
-        }
+            }
         
         // Attach listeners to keep command preview in sync with form values
+        // Also reset preset to "custom" when user manually changes values
         try {
-          const names = [
-            "epochs","batch_size","image_repeats","lr","resolution",
-            "seed","rank","dims","output_dir","output_name",
-            "sample_every_epochs","sample_every_steps"
-          ];
-          names.forEach(n => {
+        const names = [
+          "epochs","batch_size","image_repeats","lr","resolution",
+          "seed","rank","dims","output_dir","output_name",
+          "sample_every_epochs","sample_every_steps"
+        ];
+        names.forEach(n => {
             try {
-              const el = document.querySelector('input[name="' + n + '"]');
+          const el = document.querySelector('input[name="' + n + '"]');
               if (el && typeof updateCommandPreview === 'function') {
-                el.addEventListener('input', updateCommandPreview);
-                el.addEventListener('change', updateCommandPreview);
+                el.addEventListener('input', function() {
+                  // Remove field error styling when user starts typing
+                  this.classList.remove('field-error');
+                  
+                  updateCommandPreview();
+                  // Update preset dropdown when user manually changes training parameters
+                  if (['epochs', 'batch_size', 'image_repeats', 'lr', 'rank', 'dims'].includes(n)) {
+                    // Use setTimeout to allow value to update first
+                    setTimeout(function() {
+                      if (typeof updatePresetDropdown === 'function') {
+                        updatePresetDropdown();
+                      }
+                    }, 10);
+                  }
+                });
+                el.addEventListener('change', function() {
+                  this.classList.remove('field-error');
+                  updateCommandPreview();
+                });
               }
             } catch (err) {
               console.error('Error attaching listener to ' + n + ':', err);
@@ -2009,59 +3724,59 @@ HTML = r'''
         
         // Setup VRAM profile selector
         try {
-          const vramSel = document.querySelector('select[name="vram_profile"]');
+        const vramSel = document.querySelector('select[name="vram_profile"]');
           if (vramSel && typeof syncAdvancedFlagsFromGui === 'function') {
-            vramSel.addEventListener('change', function() {
-              syncAdvancedFlagsFromGui(false);
-            });
-          }
+          vramSel.addEventListener('change', function() {
+            syncAdvancedFlagsFromGui(false);
+          });
+        }
         } catch (err) {
           console.error('Error setting up VRAM selector:', err);
         }
         
         // Setup optimizer selector
         try {
-          const optSel = document.querySelector('select[name="optimizer_type"]');
+        const optSel = document.querySelector('select[name="optimizer_type"]');
           if (optSel && typeof updateCommandPreview === 'function') {
-            optSel.addEventListener('change', updateCommandPreview);
-          }
+          optSel.addEventListener('change', updateCommandPreview);
+        }
         } catch (err) {
           console.error('Error setting up optimizer selector:', err);
         }
         
         // Setup advanced flags textarea
         try {
-          const advFlags = document.querySelector('textarea[name="advanced_flags"]');
+        const advFlags = document.querySelector('textarea[name="advanced_flags"]');
           if (advFlags && typeof updateCommandPreview === 'function') {
-            advFlags.addEventListener('input', function() {
-              advFlagsDirty = true;
-              updateCommandPreview();
-            });
-          }
+          advFlags.addEventListener('input', function() {
+            advFlagsDirty = true;
+            updateCommandPreview();
+          });
+        }
         } catch (err) {
           console.error('Error setting up advanced flags:', err);
         }
         
         // Setup sample prompt textarea
         try {
-          const samplePromptTextarea = document.getElementById('sample_prompt_text');
+        const samplePromptTextarea = document.getElementById('sample_prompt_text');
           if (samplePromptTextarea && typeof updateCommandPreview === 'function') {
-            samplePromptTextarea.addEventListener('input', updateCommandPreview);
-          }
+          samplePromptTextarea.addEventListener('input', updateCommandPreview);
+        }
         } catch (err) {
           console.error('Error setting up sample prompt textarea:', err);
         }
         
         // Setup samples checkbox
         try {
-          const samplesCheckbox = document.getElementById('samples_enabled');
-          if (samplesCheckbox) {
-            samplesCheckbox.addEventListener('change', () => {
-              if (window.toggleSampleOptions) {
-                window.toggleSampleOptions();
-              }
+        const samplesCheckbox = document.getElementById('samples_enabled');
+        if (samplesCheckbox) {
+          samplesCheckbox.addEventListener('change', () => {
+            if (window.toggleSampleOptions) {
+              window.toggleSampleOptions();
+            }
               if (typeof updateCommandPreview === 'function') {
-                updateCommandPreview();
+            updateCommandPreview();
               }
             });
           }
@@ -2071,10 +3786,10 @@ HTML = r'''
         
         // Setup sample at first checkbox
         try {
-          const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
+        const sampleAtFirstCheckbox = document.getElementById('sample_at_first');
           if (sampleAtFirstCheckbox && typeof updateCommandPreview === 'function') {
-            sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
-          }
+          sampleAtFirstCheckbox.addEventListener('change', updateCommandPreview);
+        }
         } catch (err) {
           console.error('Error setting up sample at first checkbox:', err);
         }
@@ -2082,23 +3797,23 @@ HTML = r'''
         // Initialize form values - wrap each in try-catch
         try {
           if (typeof syncAdvancedFlagsFromGui === 'function') {
-            syncAdvancedFlagsFromGui(true);
+        syncAdvancedFlagsFromGui(true);
           }
         } catch (err) {
           console.error('Error syncing advanced flags:', err);
         }
         
         try {
-          if (window.toggleSampleOptions) {
-            window.toggleSampleOptions();
-          }
+        if (window.toggleSampleOptions) {
+          window.toggleSampleOptions();
+        }
         } catch (err) {
           console.error('Error toggling sample options:', err);
         }
         
         try {
           if (typeof updateCommandPreview === 'function') {
-            updateCommandPreview();
+        updateCommandPreview();
           }
         } catch (err) {
           console.error('Error updating command preview:', err);
@@ -2106,7 +3821,7 @@ HTML = r'''
         
         try {
           if (typeof updateCaptionLengthLabel === 'function') {
-            updateCaptionLengthLabel();
+        updateCaptionLengthLabel();
           }
         } catch (err) {
           console.error('Error updating caption length label:', err);
@@ -2114,7 +3829,7 @@ HTML = r'''
         
         try {
           if (typeof updateDetailLevelLabel === 'function') {
-            updateDetailLevelLabel();
+        updateDetailLevelLabel();
           }
         } catch (err) {
           console.error('Error updating detail level label:', err);
@@ -2122,29 +3837,88 @@ HTML = r'''
         
         try {
           if (typeof updateFinalPath === 'function') {
-            updateFinalPath();
+        updateFinalPath();
           }
         } catch (err) {
           console.error('Error updating final path:', err);
+        }
+        
+        // Detect and set initial preset based on current form values
+        try {
+          setTimeout(function() {
+            if (typeof updatePresetDropdown === 'function') {
+              updatePresetDropdown();
+            }
+          }, 100);
+        } catch (err) {
+          console.error('Error detecting initial preset:', err);
         }
         
         // Load sample gallery and README link with delay to avoid blocking
         setTimeout(function() {
           try {
             if (typeof refreshSampleGallery === 'function') {
-              refreshSampleGallery(true);
+          refreshSampleGallery(true);
             }
-          } catch (err) {
-            console.error('Failed to load sample gallery on page load:', err);
-          }
-          try {
+        } catch (err) {
+          console.error('Failed to load sample gallery on page load:', err);
+        }
+        try {
             if (typeof refreshReadmeLink === 'function') {
-              refreshReadmeLink();
+          refreshReadmeLink();
             }
-          } catch (err) {
-            console.error('Failed to refresh README link on load:', err);
-          }
+        } catch (err) {
+          console.error('Failed to refresh README link on load:', err);
+        }
         }, 200);
+        
+        
+        // Load server info for footer
+        setTimeout(function() {
+          try {
+            fetch('/server_info')
+              .then(resp => resp.json())
+              .then(data => {
+                const infoEl = document.getElementById('server-info');
+                if (infoEl && data) {
+                  const parts = [];
+                  if (data.version) parts.push('v' + data.version);
+                  if (data.webserver) parts.push(data.webserver);
+                  if (data.os) {
+                    const osStr = data.os_release ? data.os + ' ' + data.os_release : data.os;
+                    parts.push(osStr);
+                  }
+                  if (data.gpu) {
+                    // Shorten GPU name if too long (e.g., "NVIDIA GeForce RTX 4090" -> "RTX 4090")
+                    let gpuStr = data.gpu;
+                    if (gpuStr.length > 20) {
+                      const match = gpuStr.match(/(RTX|GTX|RX|A\d+)\s*[\d\w]+/i);
+                      if (match) {
+                        gpuStr = match[0];
+            } else {
+                        gpuStr = gpuStr.substring(0, 17) + '...';
+                      }
+                    }
+                    parts.push(gpuStr);
+                  }
+                  if (data.pytorch_version) {
+                    parts.push('PyTorch ' + data.pytorch_version.split('+')[0]); // Remove +cu118 etc.
+                  }
+                  if (data.cuda_version) {
+                    parts.push('CUDA ' + data.cuda_version);
+                  }
+                  if (parts.length > 0) {
+                    infoEl.textContent = '• ' + parts.join(' • ');
+                  }
+                }
+              })
+              .catch(err => {
+                // Silently fail - server info is not critical
+              });
+          } catch (err) {
+            // Silently fail
+          }
+        }, 300);
         
       } catch (err) {
         console.error('❌ Error during page initialization:', err);
@@ -3023,6 +4797,180 @@ def system_resources():
         }
     })
 
+@app.route("/caption_model_status")
+def caption_model_status():
+    """Check if caption models are already loaded and if they're cached on disk."""
+    caption_model_choice = request.args.get("model", "vit-gpt2").strip().lower()
+    
+    model_loaded = False
+    model_cached = False
+    
+    if caption_model_choice == "qwen-vl":
+        model_loaded = caption_qwen_vl_model is not None
+        # Qwen-VL is a local file, check if it exists in any of the possible locations
+        # Use EXACTLY the same paths and logic as in load_qwen_vl_caption_model()
+        webgui_dir = os.path.dirname(os.path.abspath(__file__))
+        model_filename = "qwen_2.5_vl_7b.safetensors"
+        
+        # Build list of possible paths (EXACTLY same as load_qwen_vl_caption_model)
+        possible_paths = []
+        
+        # 1. User override via environment variable
+        env_path = os.environ.get("CAPTION_MODEL_PATH_QWEN_VL", "")
+        if env_path:
+            possible_paths.append(env_path)
+        
+        # 2. Same directory as webgui.py (MOST COMMON - check this first!)
+        webgui_path = os.path.join(webgui_dir, model_filename)
+        possible_paths.append(webgui_path)
+        
+        # 3. Current working directory
+        cwd_path = os.path.join(os.getcwd(), model_filename)
+        possible_paths.append(cwd_path)
+        
+        # 4. Relative path from current directory
+        possible_paths.append(model_filename)
+        
+        # Check all possible paths (EXACTLY same logic as load_qwen_vl_caption_model)
+        for path in possible_paths:
+            if not path:
+                continue
+            # Try both absolute and relative path
+            abs_path = os.path.abspath(path)
+            if os.path.exists(abs_path) and os.path.isfile(abs_path):
+                model_cached = True
+                break
+            if os.path.exists(path) and os.path.isfile(path):
+                model_cached = True
+                break
+    elif caption_model_choice == "blip-large":
+        model_loaded = caption_blip_model is not None
+        # Check if BLIP model is cached in Hugging Face cache
+        try:
+            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            if os.path.exists(cache_dir):
+                # Look for blip or salesforce in cache directory names
+                for item in os.listdir(cache_dir):
+                    item_lower = item.lower()
+                    if "blip" in item_lower or "salesforce" in item_lower:
+                        # Check if it's a valid cache entry (has snapshots subdirectory or model files)
+                        item_path = os.path.join(cache_dir, item)
+                        if os.path.isdir(item_path):
+                            # Check for snapshots directory or model files
+                            has_snapshots = False
+                            has_model_files = False
+                            for subitem in os.listdir(item_path):
+                                subitem_path = os.path.join(item_path, subitem)
+                                if subitem == "snapshots" and os.path.isdir(subitem_path):
+                                    has_snapshots = True
+                                    break
+                                if os.path.isfile(subitem_path) and (subitem.endswith('.bin') or subitem.endswith('.safetensors') or subitem.endswith('.pt')):
+                                    has_model_files = True
+                                    break
+                            if has_snapshots or has_model_files:
+                                model_cached = True
+                                break
+        except:
+            pass
+    else:  # vit-gpt2
+        model_loaded = caption_vit_model is not None
+        # Check if ViT-GPT2 model is cached in Hugging Face cache
+        try:
+            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            if os.path.exists(cache_dir):
+                # Look for nlpconnect or vit-gpt2 in cache directory names
+                for item in os.listdir(cache_dir):
+                    item_lower = item.lower()
+                    if ("vit" in item_lower and "gpt2" in item_lower) or "nlpconnect" in item_lower:
+                        # Check if it's a valid cache entry (has snapshots subdirectory or model files)
+                        item_path = os.path.join(cache_dir, item)
+                        if os.path.isdir(item_path):
+                            # Check for snapshots directory or model files
+                            has_snapshots = False
+                            has_model_files = False
+                            for subitem in os.listdir(item_path):
+                                subitem_path = os.path.join(item_path, subitem)
+                                if subitem == "snapshots" and os.path.isdir(subitem_path):
+                                    has_snapshots = True
+                                    break
+                                if os.path.isfile(subitem_path) and (subitem.endswith('.bin') or subitem.endswith('.safetensors') or subitem.endswith('.pt')):
+                                    has_model_files = True
+                                    break
+                            if has_snapshots or has_model_files:
+                                model_cached = True
+                                break
+        except:
+            pass
+    
+    return jsonify({
+        "model_loaded": model_loaded,
+        "model_cached": model_cached,
+        "model": caption_model_choice
+    })
+
+@app.route("/server_info")
+def server_info():
+    """Return server information (version, webserver type, system info, etc.)"""
+    # Detect which webserver is available (same logic as server startup)
+    webserver = "Unknown"
+    try:
+        import gevent
+        webserver = "gevent"
+    except ImportError:
+        try:
+            import waitress
+            webserver = "waitress"
+        except ImportError:
+            webserver = "Flask (dev)"
+    
+    # Get OS/platform
+    os_name = platform.system()
+    os_release = platform.release() if hasattr(platform, 'release') else None
+    
+    # Get GPU info
+    gpu_name = None
+    cuda_version = None
+    pytorch_version = None
+    
+    try:
+        import torch
+        pytorch_version = torch.__version__
+        if torch.cuda.is_available():
+            # Get GPU name from PyTorch
+            gpu_name = torch.cuda.get_device_properties(0).name
+            # Get CUDA version
+            cuda_version = torch.version.cuda if hasattr(torch.version, 'cuda') else None
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            gpu_name = "Apple Silicon (MPS)"
+    except ImportError:
+        pass
+    
+    # Try to get GPU name from nvidia-smi as fallback (more detailed info)
+    if not gpu_name:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                gpu_name = result.stdout.strip().split('\n')[0]  # Get first GPU name
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            pass
+    
+    return jsonify({
+        "version": "0.2.5",
+        "webserver": webserver,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "os": os_name,
+        "os_release": os_release,
+        "gpu": gpu_name,
+        "cuda_version": cuda_version,
+        "pytorch_version": pytorch_version
+    })
+
 @app.route("/musubitlx_gui_readme")
 def musubitlx_gui_readme():
     # Serve the GUI README markdown file so it can be opened from the footer link
@@ -3653,14 +5601,32 @@ def gui():
                                                     pass
                                                 log_file.write("="*60 + "\n")
                                             elif not ram_aborted:  # Don't show error message if RAM aborted (already handled above)
-                                                output_queue.put("\n" + "="*60 + "\n")
-                                                output_queue.put(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
-                                                output_queue.put("="*60 + "\n")
-                                                output_queue.put(f"See log file for details: {log_path}\n")
+                                                # Check if process was cancelled (SIGTERM = -15)
+                                                try:
+                                                    is_sigterm = proc.returncode == -signal.SIGTERM or proc.returncode == -15
+                                                except (AttributeError, ImportError):
+                                                    # Windows doesn't have SIGTERM in signal module, just check for -15
+                                                    is_sigterm = proc.returncode == -15
                                                 
-                                                log_file.write("\n" + "="*60 + "\n")
-                                                log_file.write(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
-                                                log_file.write("="*60 + "\n")
+                                                if is_sigterm:
+                                                    # Process was cancelled by user - this is expected behavior
+                                                    output_queue.put("\n" + "="*60 + "\n")
+                                                    output_queue.put("⏹ TRAINING CANCELLED BY USER\n")
+                                                    output_queue.put("="*60 + "\n")
+                                                    
+                                                    log_file.write("\n" + "="*60 + "\n")
+                                                    log_file.write("⏹ TRAINING CANCELLED BY USER\n")
+                                                    log_file.write("="*60 + "\n")
+                                                else:
+                                                    # Actual error occurred
+                                                    output_queue.put("\n" + "="*60 + "\n")
+                                                    output_queue.put(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
+                                                    output_queue.put("="*60 + "\n")
+                                                    output_queue.put(f"See log file for details: {log_path}\n")
+                                                    
+                                                    log_file.write("\n" + "="*60 + "\n")
+                                                    log_file.write(f"❌ TRAINING ABORTED WITH ERROR (exit code {proc.returncode})\n")
+                                                    log_file.write("="*60 + "\n")
                                             
                                             log_file.write(f"\nTraining finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                                             if ram_aborted:
